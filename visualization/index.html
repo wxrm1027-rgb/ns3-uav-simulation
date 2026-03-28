@@ -1,0 +1,121 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>异构 NMS 仿真可视化</title>
+  <link rel="stylesheet" href="styles.css?v=20260328-5">
+  <script src="https://cdn.jsdelivr.net/npm/echarts@5.4.3/dist/echarts.min.js"></script>
+</head>
+<body>
+  <header class="header">
+    <h1>异构无人机集群网络管理仿真平台</h1>
+    <div class="header-actions">
+      <label>加载：<input type="file" id="loadDir" accept=".json,.jsonl" multiple></label>
+      <input type="text" id="resultPath" placeholder="data 或 相对路径">
+      <button id="btnLoad">加载</button>
+      <button id="btnExportCsv">导出事件 CSV</button>
+      <button id="btnExportCharts">导出图表 PNG</button>
+    </div>
+  </header>
+  <main class="main">
+    <section class="topology-section">
+      <div class="topology-header">
+        <h3>拓扑</h3>
+        <div id="topologyLegend" class="legend"></div>
+        <button type="button" id="topologyFitView" class="btn-fit-view" title="缩放并居中">适应视图</button>
+      </div>
+      <div id="topology" class="topology"></div>
+    </section>
+    <section class="content-section">
+      <aside class="left-sidebar">
+        <section class="panel">
+          <h3>子网/类型筛选</h3>
+          <label><input type="checkbox" id="filterGmc" checked> GMC</label>
+          <label><input type="checkbox" id="filterLte" checked> LTE</label>
+          <label><input type="checkbox" id="filterAdhoc" checked> Ad-hoc</label>
+          <label><input type="checkbox" id="filterDatalink" checked> 战术数据链</label>
+          <label><input type="checkbox" id="filterSpn" checked> SPN</label>
+          <label><input type="checkbox" id="filterTsn" checked> TSN</label>
+        </section>
+        <section class="panel">
+          <h3>事件列表</h3>
+          <div id="eventList" class="event-list"></div>
+        </section>
+        <section class="panel" id="businessFlowPanel">
+          <h3>业务流筛选</h3>
+          <div id="businessFlowList" class="business-flow-list"></div>
+        </section>
+        <section class="panel node-detail-panel" id="nodeDetailPanel">
+          <h3>节点详情</h3>
+          <div id="nodeDetailContent" class="node-detail-content empty">点击拓扑中的节点查看详情</div>
+        </section>
+      </aside>
+      <div class="charts-area">
+        <section class="panel charts-panel">
+          <h3>统计图表</h3>
+          <div class="chart-tabs">
+            <button type="button" class="chart-tab active" data-chart="perf">业务性能</button>
+            <button type="button" class="chart-tab" data-chart="spn">SPN 选举</button>
+            <button type="button" class="chart-tab" data-chart="business">系统性能</button>
+          </div>
+          <div class="charts-panel-scroll" id="chartsPanelScroll">
+            <div id="chartPerf" class="chart-box active chart-box-business">
+              <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin-bottom:8px;">
+                <label style="color:#aaa;">业务流
+                  <select id="perfFlowSelect" style="margin-left:6px;background:#1f1f1f;color:#ddd;border:1px solid #444;padding:2px 6px;border-radius:4px;"></select>
+                </label>
+                <button id="btnPerfMetricThroughput" type="button">吞吐量</button>
+                <button id="btnPerfMetricDelay" type="button">时延</button>
+                <button id="btnPerfMetricLoss" type="button">丢包率</button>
+              </div>
+              <div style="display:flex;justify-content:flex-end;margin-bottom:8px;">
+                <div id="perfSummaryBox" style="min-width:420px;max-width:100%;background:#121821;border:1px solid #3a4b66;border-radius:8px;padding:8px 10px;color:#d8e5ff;box-shadow:0 0 0 1px rgba(32,96,192,0.15) inset;font-size:12px;line-height:1.6;"></div>
+              </div>
+              <div id="chartPerfMetric" style="width:100%;height:420px;min-height:420px;display:block;"></div>
+              <div id="chartPerfTable" class="business-features-table chart-business-table"></div>
+            </div>
+            <div id="chartSpn" class="chart-box"></div>
+            <div id="chartBusiness" class="chart-box chart-box-business">
+              <div class="chart-business-title">系统指标（雷达图）</div>
+              <div style="display:flex;gap:12px;align-items:stretch;flex-wrap:wrap;">
+                <div id="chartBusinessRadar" class="chart-business-radar" style="flex:2 1 420px;height:240px;min-height:240px;display:block;"></div>
+                <div id="businessGlobalKpiBox" style="flex:1 1 260px;background:#121821;border:1px solid #3a4b66;border-radius:8px;padding:10px;color:#d8e5ff;box-shadow:0 0 0 1px rgba(32,96,192,0.15) inset;font-size:12px;line-height:1.7;"></div>
+              </div>
+              <div class="chart-business-title">链路质量时序</div>
+              <div id="chartBusinessLinkQ" style="width:100%;height:220px;min-height:220px;display:block;"></div>
+              <div id="chartBusinessTable" class="business-features-table chart-business-table"></div>
+            </div>
+            <div class="chart-export">
+              <button id="btnExportChartCsv">导出当前图表 CSV</button>
+            </div>
+          </div>
+        </section>
+      </div>
+    </section>
+  </main>
+  <footer class="timeline-bar">
+    <span class="time-label">仿真时间</span>
+    <div class="timeline-wrap">
+      <div class="timeline-track-row">
+        <div class="timeline-markers" id="timelineMarkers" aria-hidden="true"></div>
+        <input type="range" id="timeline" min="0" max="90" value="0" step="0.1">
+      </div>
+      <div class="timeline-scale" id="timelineScale"></div>
+    </div>
+    <span id="timeLabel">0.00 s</span>
+    <div class="playback-btns">
+      <button id="btnPlay">播放</button>
+      <button id="btnPause">暂停</button>
+      <button id="btnReset">重置</button>
+    </div>
+  </footer>
+  <div id="nodeDetailOverlay" class="node-detail-overlay" style="display:none;">
+    <div id="nodeDetailPopup" class="node-detail-popup">
+      <h4>节点详情</h4>
+      <div id="nodeDetailBody" class="node-detail-body"></div>
+    </div>
+  </div>
+  <script src="app.js?v=20260328-5"></script>
+</body>
+</html>

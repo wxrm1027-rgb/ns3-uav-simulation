@@ -1,0 +1,178 @@
+[
+  {
+    "node_id": 0,
+    "type": "GMC",
+    "subnet": "gmc",
+    "join_time": 0.0,
+    "init_pos": [0, 0, 0],
+    "speed": 0,
+    "ip": "",
+    "initial_energy": 1.0,
+    "initial_link_quality": 0.95
+  },
+  {
+    "node_id": 1,
+    "type": "node",
+    "subnet": "Adhoc",
+    "join_time": 0.0,
+    "init_pos": [100, 100, 0],
+    "speed": 0,
+    "initial_energy": 0.85,
+    "initial_link_quality": 0.9,
+    "neighbors": [2]
+  },
+  {
+    "node_id": 2,
+    "type": "node",
+    "subnet": "Adhoc",
+    "join_time": 0.0,
+    "init_pos": [110, 100, 0],
+    "speed": 0,
+    "initial_energy": 0.85,
+    "initial_link_quality": 0.9,
+    "neighbors": [1, 3, 5]
+  },
+  {
+    "node_id": 3,
+    "type": "node",
+    "subnet": "Adhoc",
+    "join_time": 5.0,
+    "init_pos": [105, 105, 0],
+    "speed": 0,
+    "initial_energy": 0.95,
+    "initial_link_quality": 0.95,
+    "neighbors": [2, 4]
+  },
+  {
+    "node_id": 4,
+    "type": "node",
+    "subnet": "Adhoc",
+    "join_time": 0.0,
+    "init_pos": [100, 110, 0],
+    "speed": 0,
+    "initial_energy": 0.85,
+    "initial_link_quality": 0.9,
+    "neighbors": [2, 3]
+  },
+  {
+    "node_id": 5,
+    "type": "node",
+    "subnet": "Adhoc",
+    "join_time": 0.0,
+    "init_pos": [110, 110, 0],
+    "speed": 0,
+    "initial_energy": 0.85,
+    "initial_link_quality": 0.9,
+    "neighbors": [2]
+  },
+  {
+    "node_id": 6,
+    "type": "node",
+    "subnet": "DataLink",
+    "join_time": 0.0,
+    "init_pos": [220, 20, 0],
+    "speed": 15,
+    "initial_energy": 0.85,
+    "initial_link_quality": 0.88,
+    "neighbors": [7]
+  },
+  {
+    "node_id": 7,
+    "type": "node",
+    "subnet": "DataLink",
+    "join_time": 0.0,
+    "init_pos": [245, 30, 0],
+    "speed": 16,
+    "initial_energy": 0.85,
+    "initial_link_quality": 0.88,
+    "neighbors": [6, 8]
+  },
+  {
+    "node_id": 8,
+    "type": "node",
+    "subnet": "DataLink",
+    "join_time": 0.0,
+    "init_pos": [270, 20, 0],
+    "speed": 17,
+    "initial_energy": 0.85,
+    "initial_link_quality": 0.88,
+    "neighbors": [7, 9]
+  },
+  {
+    "node_id": 9,
+    "type": "node",
+    "subnet": "DataLink",
+    "join_time": 0.0,
+    "init_pos": [295, 30, 0],
+    "speed": 18,
+    "initial_energy": 0.85,
+    "initial_link_quality": 0.88,
+    "neighbors": [8]
+  },
+  {
+    "node_id": 10,
+    "type": "eNB",
+    "subnet": "LTE",
+    "join_time": 0.0,
+    "init_pos": [50, 50, 0],
+    "speed": 0,
+    "initial_energy": 1.0,
+    "initial_link_quality": 0.95,
+    "neighbors": [11, 12, 13, 14, 15]
+  },
+  {
+    "node_id": 11,
+    "type": "UE",
+    "subnet": "LTE",
+    "join_time": 0.0,
+    "init_pos": [10, 10, 0],
+    "speed": 0,
+    "initial_energy": 0.88,
+    "initial_link_quality": 0.9,
+    "neighbors": [10]
+  },
+  {
+    "node_id": 12,
+    "type": "UE",
+    "subnet": "LTE",
+    "join_time": 10.0,
+    "init_pos": [25, 25, 0],
+    "speed": 0,
+    "initial_energy": 0.95,
+    "initial_link_quality": 0.95,
+    "neighbors": [10]
+  },
+  {
+    "node_id": 13,
+    "type": "UE",
+    "subnet": "LTE",
+    "join_time": 12.0,
+    "init_pos": [40, 10, 0],
+    "speed": 0,
+    "initial_energy": 0.88,
+    "initial_link_quality": 0.9,
+    "neighbors": [10]
+  },
+  {
+    "node_id": 14,
+    "type": "UE",
+    "subnet": "LTE",
+    "join_time": 14.0,
+    "init_pos": [55, 25, 0],
+    "speed": 0,
+    "initial_energy": 0.88,
+    "initial_link_quality": 0.9,
+    "neighbors": [10]
+  },
+  {
+    "node_id": 15,
+    "type": "UE",
+    "subnet": "LTE",
+    "join_time": 16.0,
+    "init_pos": [85, 35, 0],
+    "speed": 0,
+    "initial_energy": 0.88,
+    "initial_link_quality": 0.9,
+    "neighbors": [10]
+  }
+]

@@ -36,6 +36,7 @@
 
 #include <cmath>
 #include <algorithm>
+#include <cctype>
 #include <cstdio>
 #include <cstring>
 #include <ctime>
@@ -1122,6 +1123,11 @@ public:
   /// 当前是否为子网 SPN（供 state jsonl 写入 role，便于退网后新 SPN 在可视化中正确显示）
   bool IsSpn () const { return m_isSpn; }
   bool IsBackupSpn () const { return m_isBackupSpn; }
+  /// 供 JSONL 全量快照：应用是否在运行、子网类型与 UV-MIB 瞬时值（不修改选举状态）
+  bool IsApplicationRunning () const { return m_running; }
+  SubnetType GetSubnetType () const { return m_subnetType; }
+  double GetUvMibEnergy () const { return m_uvMib.m_energy; }
+  double GetUvMibLinkQuality () const { return m_uvMib.m_linkQuality; }
   uint64_t GetProtocolSuppressCount () const { return m_protocolSuppressCount; }
   uint64_t GetReportedPackets () const { return m_reportedPackets; }
   uint64_t GetTotalScheduleDecisions () const { return m_totalScheduleDecisions; }
@@ -1145,6 +1151,8 @@ public:
 
   /// 设置入网初始 UV-MIB（由 joinconfig 注入；energy/linkQuality 在 [0,1]，<0 表示不覆盖）
   void SetInitialUvMib (double energy, double linkQuality);
+  /// LTE：区分 eNB / UE 以采用不同 Score 权重（仅 SUBNET_LTE 有效）
+  void SetLteNodeKind (bool isEnb);
 
   /// 时序入网：设置本节点入网时间（秒），未入网前应用层静默、不耗电
   void SetJoinTime (double joinTimeSec);
@@ -1155,7 +1163,14 @@ public:
   /// 事件注入：强制节点失效（能量置 0、停止发包、关闭 socket），用于模拟断电/宕机
   void ForceFail ();
   /// 事件注入：触发一次立即重选（用于节点故障后加速收敛）
-  void TriggerElectionNow ();
+  void TriggerElectionNow (const std::string& electReason = std::string ());
+  /// 退网/拓扑剔除：从本地与共享 Score 视图移除某节点，避免重选仍计入已失效节点
+  void SpnForgetPeer (uint32_t peerNodeId);
+
+  /// 每次仿真 Run 前清空静态子网选举状态（避免同进程多次 Run 残留）
+  static void ResetSharedElectionState ();
+  /// 子网内 join_time<=0 的节点数，用于首轮选举等待分数视图收敛
+  static void SetExpectedInitialElectionMembers (SubnetType st, uint32_t count);
 
 protected:
   virtual void StartApplication (void); ///< Application 启动时被调用
@@ -1236,8 +1251,20 @@ private:
   /// 备 SPN 周期检查心跳超时并触发接管（连续3次）
   void CheckPrimaryHeartbeat ();
 
-  /// 动态选举：根据自身与邻居 Score 更新 m_isSpn、m_isBackupSpn、m_reportTargetAddress，并重连 m_socket
-  void RunElection ();
+  /// 仅同步分数到共享视图并刷新本地角色（不触发主备重算、不产生 SPN_ELECT）
+  void SpnMergeScoresIntoShared (double myScore);
+  void ApplyLocalRoleFromShared ();
+  void SpnSyncScoresOnly (double myScore);
+  /// 条件触发完整选举：首轮 / 新节点入网 / 主 SPN 持续劣化（非 STATE_CHANGE 路径）
+  void MaybeTriggerSpnElection (double myScore);
+  /// 完整子网选举（主备重算、可产生 SPN_ELECT/SPN_ANNOUNCE）；故障与心跳也走此路径
+  void RunFullElection (const std::string& electReason = std::string ());
+  /// 条件 C：仅 Primary 上周期评估（10s 一次）
+  void EvaluateConditionC ();
+  void OnConditionCEval ();
+  void SyncConditionCTimer ();
+  /// 延迟一次 Score 泛洪（使用当前计算的分数），用于入网后加速全子网分数对齐
+  void BroadcastScoreFloodCurrent ();
 
   /// SPN：接收子网内节点上报，聚合缓存（含拓扑解码）
   void RecvFromSubnet (Ptr<Socket> socket);
@@ -1299,6 +1326,7 @@ private:
   std::map<Ipv4Address, std::vector<uint8_t>> m_aggregateBuf;  ///< 按源 IP 缓存最新 TLV
   EventId         m_flushEvent;           ///< 聚合上报定时器
   EventId         m_heartbeatEvent;       ///< 主备心跳事件
+  EventId         m_conditionCTimer;      ///< 条件 C：仅 Primary 上 10s 周期评估
   Time            m_aggregateInterval;    ///< 聚合上报周期
 
   /// 动态选举与邻居发现（Adhoc/DataLink）
@@ -1320,7 +1348,14 @@ private:
   static const double SCORE_OUTPUT_EMA_ALPHA;      ///< 最终 Score EMA 系数
   static const double SPN_PRIMARY_SCORE_THRESHOLD; ///< 主 SPN 得分阈值（低于该值才触发一次得分降级切换）
   static const double SPN_INITIAL_ELECTION_WARMUP_SEC; ///< 初始选举预热窗口，避免启动瞬时误选
+  static const double SPN_INITIAL_ELECTION_DEADLINE_SEC; ///< 首轮选举最长等待（秒），超时则用已有分数完成选举
   static const uint32_t SPN_PRIMARY_STABLE_TICKS;  ///< 连续多少次 RunElection 认定同一主 SPN 后才切换 committed 主
+  /// 选举与分数更新解耦：重选最小间隔（秒，仅用于条件 C 触发完整重选的门控）
+  static constexpr double MIN_ELECT_INTERVAL_SEC = 15.0;
+  /// 仅条件 C：非 Primary 分数需持续高于 Primary + Margin 才进入挑战计数（条件 A 迟入网不使用 Margin）
+  static constexpr double SCORE_ELECT_MARGIN = 0.1;
+  static constexpr double CONDITION_C_PERIOD_SEC = 10.0;
+  static constexpr uint32_t CONDITION_C_CONFIRM_PERIODS = 2;
   uint32_t        m_currentPrimaryId;      ///< 当前感知的主SPN
   double          m_lastPrimaryHeartbeatTs;///< 最近收到主SPN心跳时刻
   uint8_t         m_missedHeartbeats;      ///< 连续丢心跳计数
@@ -1328,11 +1363,13 @@ private:
   double          m_failoverStartTs;       ///< 触发接管时刻，用于自愈耗时统计
   double          m_joinTime;             ///< 入网时间（秒），未到则应用层静默、不耗电
   bool            m_scoreFilterInit;       ///< EMA 状态是否已初始化
-  double          m_emaEnergy;             ///< 能量 EMA（用于 Score）
-  double          m_emaLink;               ///< 链路质量 EMA（用于 Score）
-  double          m_emaTopoMetric;         ///< 拓扑/移动性度量 EMA（用于 Score）
-  double          m_velocityEma;           ///< 随机速度 EMA，避免每周期全新 velocity 导致 topology 剧变
-  double          m_emaFinalScore;           ///< 对外广播/写入 global 的最终平滑 Score
+  double          m_initialEnergyRef;      ///< 初始能量（用于 E_norm=当前/初始；与 UV-MIB 同量纲，通常为 0~1）
+  bool            m_lteIsEnb;              ///< LTE eNB 为 true，UE 为 false（仅 SUBNET_LTE）
+  double          m_emaEnergy;             ///< 保留：历史 EMA 字段（兼容/预留）
+  double          m_emaLink;               ///< 保留
+  double          m_emaTopoMetric;         ///< 保留
+  double          m_velocityEma;           ///< 保留
+  double          m_emaFinalScore;           ///< 对外广播/写入 global 的最终平滑 Score（输出 EMA，约束 [0,1]）
   uint32_t        m_committedPrimaryId;    ///< 已提交的主 SPN（稳定切换前保持不变）
   uint32_t        m_primaryStableCounter;  ///< 与 m_lastRawPrimaryId 连续一致计数
   uint32_t        m_lastRawPrimaryId;      ///< 上一轮排序得到的原始主 SPN 候选
@@ -1362,6 +1399,20 @@ private:
   uint64_t        m_aggregateSuppressedCount;
   uint64_t        m_aggregateRawBytes;
   uint64_t        m_aggregateSentBytes;
+  bool            m_initialScoreFloodSent; ///< 尽快广播一次 Score 泛洪，使子网分数视图一致
+  /// join_time>0 的节点：首次跨过入网时刻后是否已做过「新节点 vs Primary」重选评估
+  bool            m_postJoinElectEvaluated;
+  /// Adhoc/DataLink 最近一次 SPN 三分项归一化（用于日志与可视化）
+  double          m_lastSpnBatteryNorm;
+  double          m_lastSpnConnNorm;
+  double          m_lastSpnStabNorm;
+  struct SpnElectHistoryEntry
+  {
+    double timeSec;
+    uint32_t primaryId;
+    uint32_t backupId;
+    std::string reason;
+  };
   struct SharedSpnState
   {
     bool initialized;
@@ -1371,6 +1422,11 @@ private:
     bool energySwitchUsed;
     bool frozen;
     double initializedTs;
+    double lastElectTs;           ///< 最近一次完成完整选举计算的时刻（秒），<0 表示尚未记录
+    bool stablePhase;             ///< 已完成首轮 INIT 之后为 true（STABLE_PHASE）
+    uint32_t challengeChallengerId; ///< 条件 C：当前挑战者 nodeId（0 表示无）
+    uint32_t challengeConsecutive;  ///< 条件 C：连续满足周期数，达到 CONDITION_C_CONFIRM_PERIODS 触发重选
+    std::vector<SpnElectHistoryEntry> electHistory;
     std::map<uint32_t, double> scoreByNode;
     std::map<uint32_t, double> scoreTimeByNode;
     SharedSpnState ()
@@ -1380,12 +1436,18 @@ private:
         failoverUsed (false),
         energySwitchUsed (false),
         frozen (false),
-        initializedTs (0.0)
+        initializedTs (0.0),
+        lastElectTs (-1.0),
+        stablePhase (false),
+        challengeChallengerId (0),
+        challengeConsecutive (0)
     {}
   };
-  static std::map<uint8_t, SharedSpnState> s_sharedSpnState; ///< 子网维度共享主备状态（强约束：唯一主备、最多两次切换）
-  static bool s_globalFailoverUsed; ///< 全仿真仅允许一次退网切换
-  static bool s_globalEnergyUsed;   ///< 全仿真仅允许一次低分切换
+  static std::map<uint8_t, SharedSpnState> s_sharedSpnState; ///< 子网维度共享主备状态（Adhoc/DataLink）
+  static uint32_t s_expectedAdhocInitialMembers;   ///< join_time<=0 的自组网节点数（首轮选举等待用）
+  static uint32_t s_expectedDatalinkInitialMembers; ///< join_time<=0 的数据链节点数
+  static bool s_globalFailoverUsed; ///< 兼容旧日志/统计（不再阻塞重选）
+  static bool s_globalEnergyUsed;   ///< 兼容旧日志/统计（不再阻塞重选）
   /// SPN 内部：解码后的节点状态与拓扑边（用于构建 TYPE_TOPOLOGY_AGGREGATE）
   struct NodeReportState {
     uint32_t nodeId;
@@ -1410,8 +1472,8 @@ HeterogeneousNodeApp::HeterogeneousNodeApp ()
     m_hnmpSeq (0),
     m_protocolSuppressCount (0),
     m_reportedPackets (0),
-    m_energyDeltaThreshold (0.05),
-    m_stateSuppressWindowSec (1.0),
+    m_energyDeltaThreshold (0.15),
+    m_stateSuppressWindowSec (15.0),
     m_lastStateReportTs (-1.0),
     m_maxKnownScore (0.0),
     m_isProxy (false),
@@ -1439,6 +1501,8 @@ HeterogeneousNodeApp::HeterogeneousNodeApp ()
     m_failoverStartTs (0.0),
     m_joinTime (0.0),
     m_scoreFilterInit (false),
+    m_initialEnergyRef (0.9),
+    m_lteIsEnb (false),
     m_emaEnergy (0.9),
     m_emaLink (0.85),
     m_emaTopoMetric (0.5),
@@ -1470,7 +1534,12 @@ HeterogeneousNodeApp::HeterogeneousNodeApp ()
     m_lastAggregateSendTs (-1.0),
     m_aggregateSuppressedCount (0),
     m_aggregateRawBytes (0),
-    m_aggregateSentBytes (0)
+    m_aggregateSentBytes (0),
+    m_initialScoreFloodSent (false),
+    m_postJoinElectEvaluated (true),
+    m_lastSpnBatteryNorm (0.0),
+    m_lastSpnConnNorm (0.0),
+    m_lastSpnStabNorm (0.0)
 {
   // 初始化随机数与 UV-MIB
   m_rand = CreateObject<UniformRandomVariable> ();
@@ -1494,10 +1563,36 @@ const double HeterogeneousNodeApp::SCORE_INPUT_EMA_ALPHA = 0.22;   // 输入平�
 const double HeterogeneousNodeApp::SCORE_OUTPUT_EMA_ALPHA = 0.35;  // 输出平滑：Hello/泛洪用分更稳
 const double HeterogeneousNodeApp::SPN_PRIMARY_SCORE_THRESHOLD = 0.45; // 主SPN得分低于此阈值才允许一次得分降级切换
 const double HeterogeneousNodeApp::SPN_INITIAL_ELECTION_WARMUP_SEC = 3.0; // 初始 3s 等待邻居分数同步后再锁定主备
+const double HeterogeneousNodeApp::SPN_INITIAL_ELECTION_DEADLINE_SEC = 15.0; // 首轮选举最长等待（秒）
 const uint32_t HeterogeneousNodeApp::SPN_PRIMARY_STABLE_TICKS = 5; // 约 5 个发送周期后才切换 committed 主
 std::map<uint8_t, HeterogeneousNodeApp::SharedSpnState> HeterogeneousNodeApp::s_sharedSpnState;
+uint32_t HeterogeneousNodeApp::s_expectedAdhocInitialMembers = 0;
+uint32_t HeterogeneousNodeApp::s_expectedDatalinkInitialMembers = 0;
 bool HeterogeneousNodeApp::s_globalFailoverUsed = false;
 bool HeterogeneousNodeApp::s_globalEnergyUsed = false;
+
+void
+HeterogeneousNodeApp::ResetSharedElectionState ()
+{
+  s_sharedSpnState.clear ();
+  s_globalFailoverUsed = false;
+  s_globalEnergyUsed = false;
+  s_expectedAdhocInitialMembers = 0;
+  s_expectedDatalinkInitialMembers = 0;
+}
+
+void
+HeterogeneousNodeApp::SetExpectedInitialElectionMembers (SubnetType st, uint32_t count)
+{
+  if (st == SUBNET_ADHOC)
+    {
+      s_expectedAdhocInitialMembers = count;
+    }
+  else if (st == SUBNET_DATALINK)
+    {
+      s_expectedDatalinkInitialMembers = count;
+    }
+}
 
 uint32_t
 HeterogeneousNodeApp::SerializeUvMibConfigIntent (const UvMibConfigIntentModel& m, uint8_t* out, uint32_t outSize)
@@ -1603,6 +1698,7 @@ void
 HeterogeneousNodeApp::SetJoinTime (double joinTimeSec)
 {
   m_joinTime = joinTimeSec >= 0.0 ? joinTimeSec : 0.0;
+  m_postJoinElectEvaluated = (m_joinTime <= 0.0);
 }
 
 void
@@ -1636,9 +1732,16 @@ HeterogeneousNodeApp::SetInitialUvMib (double energy, double linkQuality)
     {
       m_uvMib.m_energy = energy;
       m_uvMib.m_lastReportedEnergy = energy;
+      m_initialEnergyRef = std::max (energy, 1e-9);
     }
   if (linkQuality >= 0.0 && linkQuality <= 1.0)
     m_uvMib.m_linkQuality = linkQuality;
+}
+
+void
+HeterogeneousNodeApp::SetLteNodeKind (bool isEnb)
+{
+  m_lteIsEnb = isEnb;
 }
 
 void
@@ -1668,47 +1771,72 @@ HeterogeneousNodeApp::UpdateUvMib ()
 double
 HeterogeneousNodeApp::CalculateUtilityScore ()
 {
-  static const double w_e = 0.3;
-  static const double w_t = 0.3;
-  static const double w_l = 0.25;
-  const double aIn = SCORE_INPUT_EMA_ALPHA;
+  // LTE：Score = w1*E + w2*Q + w3*C + w4*M（四项，值域 [0,1]）
+  // Adhoc/DataLink：Score = 0.4*电量 + 0.35*连通度 + 0.25*稳定性（稳定性= m_mobilityScore 归一化）
   const double aOut = SCORE_OUTPUT_EMA_ALPHA;
   const bool firstCall = !m_scoreFilterInit;
+  static constexpr double kMaxDegree = 6.0;
 
-  // 随机速度做滑动平均，避免每个周期全新 velocity 导致 topology 项剧烈跳变
-  double vInst = m_rand->GetValue (0.0, 20.0);
-  if (firstCall)
+  double eRef = std::max (m_initialEnergyRef, 1e-9);
+  double eNorm = std::min (1.0, std::max (0.0, m_uvMib.m_energy / eRef));
+  double qNorm = std::min (1.0, std::max (0.0, m_uvMib.m_linkQuality));
+
+  double connectivity = static_cast<double> (m_neighborScores.size ());
+  if (m_subnetType == SUBNET_LTE)
     {
-      m_velocityEma = vInst;
+      connectivity = std::max (connectivity, 1.0);
+    }
+  double cNorm = std::min (connectivity / kMaxDegree, 1.0);
+  double mNorm = std::min (1.0, std::max (0.0, m_uvMib.m_mobilityScore));
+
+  double rawScore = 0.0;
+
+  if (m_subnetType == SUBNET_ADHOC || m_subnetType == SUBNET_DATALINK)
+    {
+      const double w1 = 0.4, w2 = 0.35, w3 = 0.25;
+      m_lastSpnBatteryNorm = eNorm;
+      m_lastSpnConnNorm = cNorm;
+      m_lastSpnStabNorm = mNorm;
+      rawScore = w1 * eNorm + w2 * cNorm + w3 * mNorm;
+      rawScore = std::min (1.0, std::max (0.0, rawScore));
+      if (firstCall)
+        {
+          m_emaFinalScore = rawScore;
+          m_scoreFilterInit = true;
+        }
+      else
+        {
+          m_emaFinalScore = aOut * rawScore + (1.0 - aOut) * m_emaFinalScore;
+        }
+      double score = std::min (1.0, std::max (0.0, m_emaFinalScore));
+      NS_LOG_INFO ("[Election] Node " << GetNode ()->GetId ()
+                                      << " calculated Score: "
+                                      << std::fixed << std::setprecision (3) << score
+                                      << " raw=" << rawScore
+                                      << " (SPN3: En:" << eNorm << " Cn:" << cNorm << " Stab:" << mNorm
+                                      << " w=0.4,0.35,0.25)");
+      return score;
+    }
+
+  double w1 = 0.4, w2 = 0.3, w3 = 0.2, w4 = 0.1;
+  if (m_lteIsEnb)
+    {
+      w1 = 0.4;
+      w2 = 0.35;
+      w3 = 0.15;
+      w4 = 0.1;
     }
   else
     {
-      m_velocityEma = aIn * vInst + (1.0 - aIn) * m_velocityEma;
+      w1 = 0.3;
+      w2 = 0.35;
+      w3 = 0.15;
+      w4 = 0.2;
     }
 
-  double topologyInstant = 1.0 / (1.0 + std::exp (2.0 * (m_velocityEma - 10.0)));
-  // 同时用 UV-MIB 移动性（已含小幅扰动）约束拓扑项，使 Score 与节点模型一致
-  double topoBlend = 0.6 * topologyInstant + 0.4 * m_uvMib.m_mobilityScore;
+  rawScore = w1 * eNorm + w2 * qNorm + w3 * cNorm + w4 * mNorm;
+  rawScore = std::min (1.0, std::max (0.0, rawScore));
 
-  double energy = m_uvMib.m_energy;
-  double link = m_uvMib.m_linkQuality;
-
-  if (firstCall)
-    {
-      m_emaEnergy = energy;
-      m_emaLink = link;
-      m_emaTopoMetric = topoBlend;
-    }
-  else
-    {
-      m_emaEnergy = aIn * energy + (1.0 - aIn) * m_emaEnergy;
-      m_emaLink = aIn * link + (1.0 - aIn) * m_emaLink;
-      m_emaTopoMetric = aIn * topoBlend + (1.0 - aIn) * m_emaTopoMetric;
-    }
-
-  double rawScore = w_e * m_emaEnergy + w_t * m_emaTopoMetric + w_l * m_emaLink;
-
-  // 最终得分再做一层 EMA，供 Hello / ScoreFlood / m_globalScores 使用
   if (firstCall)
     {
       m_emaFinalScore = rawScore;
@@ -1719,15 +1847,14 @@ HeterogeneousNodeApp::CalculateUtilityScore ()
       m_emaFinalScore = aOut * rawScore + (1.0 - aOut) * m_emaFinalScore;
     }
 
-  double score = m_emaFinalScore;
+  double score = std::min (1.0, std::max (0.0, m_emaFinalScore));
 
   NS_LOG_INFO ("[Election] Node " << GetNode ()->GetId ()
                                   << " calculated Score: "
                                   << std::fixed << std::setprecision (3) << score
                                   << " raw=" << rawScore
-                                  << " (E:" << m_emaEnergy
-                                  << ", T:" << m_emaTopoMetric
-                                  << ", L:" << m_emaLink << ")");
+                                  << " (En:" << eNorm << " Qn:" << qNorm << " Cn:" << cNorm << " Mn:" << mNorm
+                                  << " w=" << w1 << "," << w2 << "," << w3 << "," << w4 << ")");
   return score;
 }
 
@@ -1818,6 +1945,12 @@ HeterogeneousNodeApp::HandleHello (Ptr<Socket> socket)
       double now = Simulator::Now ().GetSeconds ();
       m_globalScores[neighborNodeId] = neighborScore;
       m_globalScoreTime[neighborNodeId] = now;
+      if (m_subnetType == SUBNET_ADHOC || m_subnetType == SUBNET_DATALINK)
+        {
+          SharedSpnState& sh = s_sharedSpnState[static_cast<uint8_t> (m_subnetType)];
+          sh.scoreByNode[neighborNodeId] = neighborScore;
+          sh.scoreTimeByNode[neighborNodeId] = now;
+        }
 
       if (neighborScore > m_maxKnownScore)
         {
@@ -1871,8 +2004,9 @@ HeterogeneousNodeApp::HandleScoreFloodPacket (const uint8_t* data, uint32_t len,
           m_helloSocket->SendTo (pkt, 0, dst);
         }
     }
-  // 收到泛洪后立即重选，缩短全网视图一致收敛时间
-  RunElection ();
+  // 分数静默合并；选举仅在 MaybeTriggerSpnElection 条件满足时触发（非每次泛洪）
+  SpnSyncScoresOnly (myScore);
+  MaybeTriggerSpnElection (myScore);
 }
 
 void
@@ -1922,7 +2056,7 @@ HeterogeneousNodeApp::CheckPrimaryHeartbeat ()
               NMS_LOG_INFO (GetNode ()->GetId (), "SPN_HEARTBEAT_LOST",
                             "primary=" + std::to_string (m_currentPrimaryId) +
                             " lost " + std::to_string ((int)m_missedHeartbeats) + " heartbeats, trigger takeover");
-              RunElection ();
+              RunFullElection ("heartbeat_primary_lost_failover");
             }
         }
     }
@@ -1957,7 +2091,162 @@ HeterogeneousNodeApp::SendScoreFlood (double myScore)
 }
 
 void
-HeterogeneousNodeApp::RunElection ()
+HeterogeneousNodeApp::BroadcastScoreFloodCurrent ()
+{
+  if (!m_running || !m_helloSocket)
+    {
+      return;
+    }
+  SendScoreFlood (CalculateUtilityScore ());
+}
+
+void
+HeterogeneousNodeApp::SpnMergeScoresIntoShared (double myScore)
+{
+  if (m_subnetType != SUBNET_ADHOC && m_subnetType != SUBNET_DATALINK)
+    {
+      return;
+    }
+  uint32_t selfId = GetNode ()->GetId ();
+  double now = Simulator::Now ().GetSeconds ();
+  m_globalScores[selfId] = myScore;
+  m_globalScoreTime[selfId] = now;
+  SharedSpnState& shared = s_sharedSpnState[static_cast<uint8_t> (m_subnetType)];
+  shared.scoreByNode[selfId] = myScore;
+  shared.scoreTimeByNode[selfId] = now;
+  for (const auto& kv : m_globalScores)
+    {
+      auto itT = m_globalScoreTime.find (kv.first);
+      double ts = (itT != m_globalScoreTime.end ()) ? itT->second : 0.0;
+      double age = now - ts;
+      if (age <= m_spnScoreStaleSec && age >= 0.0)
+        {
+          shared.scoreByNode[kv.first] = kv.second;
+          shared.scoreTimeByNode[kv.first] = ts;
+        }
+    }
+}
+
+void
+HeterogeneousNodeApp::ApplyLocalRoleFromShared ()
+{
+  if (m_subnetType != SUBNET_ADHOC && m_subnetType != SUBNET_DATALINK)
+    {
+      return;
+    }
+  uint32_t selfId = GetNode ()->GetId ();
+  SharedSpnState& shared = s_sharedSpnState[static_cast<uint8_t> (m_subnetType)];
+  m_initialSpnLocked = shared.initialized;
+  m_failoverSwitchUsed = shared.failoverUsed;
+  m_energySwitchUsed = shared.energySwitchUsed;
+  m_committedPrimaryId = shared.primaryId;
+  m_committedBackupId = shared.backupId;
+  if (m_committedPrimaryId == 0)
+    {
+      return;
+    }
+  uint32_t spnNodeId = m_committedPrimaryId;
+  uint32_t backupNodeId = (m_committedBackupId == 0) ? spnNodeId : m_committedBackupId;
+  m_currentPrimaryId = spnNodeId;
+  m_isSpn = (spnNodeId == selfId);
+  m_isBackupSpn = (backupNodeId == selfId && !m_isSpn);
+  if (!m_isSpn && spnNodeId != selfId)
+    {
+      auto it = m_neighborAddrs.find (spnNodeId);
+      if (it != m_neighborAddrs.end ())
+        m_reportTargetAddress = it->second;
+      else
+        {
+          auto itBackup = m_neighborAddrs.find (backupNodeId);
+          if (itBackup != m_neighborAddrs.end ())
+            m_reportTargetAddress = itBackup->second;
+          else
+            m_reportTargetAddress = Ipv4Address ("0.0.0.0");
+        }
+    }
+  if (m_socket && m_gmcBackhaulPort != 0)
+    {
+      Ipv4Address wantAddr ("0.0.0.0");
+      uint16_t wantPort = 0;
+      if (m_isSpn && m_gmcBackhaulAddress != Ipv4Address ("0.0.0.0"))
+        {
+          wantAddr = m_gmcBackhaulAddress;
+          wantPort = m_gmcBackhaulPort;
+        }
+      else if (!m_isSpn && m_reportTargetAddress != Ipv4Address ("0.0.0.0"))
+        {
+          wantAddr = m_reportTargetAddress;
+          wantPort = m_subnetReportPort;
+        }
+      if (wantPort != 0 && (wantAddr != m_socketReportBoundAddr || wantPort != m_socketBoundPeerPort))
+        {
+          m_socket->Connect (InetSocketAddress (wantAddr, wantPort));
+          m_socketReportBoundAddr = wantAddr;
+          m_socketBoundPeerPort = wantPort;
+        }
+    }
+}
+
+void
+HeterogeneousNodeApp::SpnSyncScoresOnly (double myScore)
+{
+  SpnMergeScoresIntoShared (myScore);
+  ApplyLocalRoleFromShared ();
+}
+
+void
+HeterogeneousNodeApp::MaybeTriggerSpnElection (double myScore)
+{
+  if (m_subnetType != SUBNET_ADHOC && m_subnetType != SUBNET_DATALINK)
+    {
+      return;
+    }
+  SharedSpnState& shared = s_sharedSpnState[static_cast<uint8_t> (m_subnetType)];
+  double now = Simulator::Now ().GetSeconds ();
+
+  if (!shared.initialized)
+    {
+      RunFullElection ("init_phase_election");
+      return;
+    }
+
+  // 条件 A：迟入网节点（无 MARGIN，按 score 与 Primary/Backup 比较分三种情况）
+  if (m_joinTime > 0.0 && !m_postJoinElectEvaluated && now >= m_joinTime)
+    {
+      m_postJoinElectEvaluated = true;
+      uint32_t pid = shared.primaryId;
+      double ps = 0.0;
+      auto itp = shared.scoreByNode.find (pid);
+      if (itp != shared.scoreByNode.end ())
+        {
+          ps = itp->second;
+        }
+      double bs = -1.0;
+      if (shared.backupId != 0 && shared.backupId != pid)
+        {
+          auto itb = shared.scoreByNode.find (shared.backupId);
+          if (itb != shared.scoreByNode.end ())
+            {
+              bs = itb->second;
+            }
+        }
+      if (myScore > ps)
+        {
+          RunFullElection ("late_join_rank_insert_primary");
+        }
+      else if (bs >= 0.0 && myScore > bs && myScore <= ps)
+        {
+          RunFullElection ("late_join_rank_insert_backup");
+        }
+      // else：new_score ≤ Backup_score → 仅作 TSN，不触发选举
+      return;
+    }
+
+  // 条件 C 在 Primary 的 OnConditionCEval 中处理（与泛洪路径解耦）
+}
+
+void
+HeterogeneousNodeApp::RunFullElection (const std::string& electReason)
 {
   if (m_subnetType != SUBNET_ADHOC && m_subnetType != SUBNET_DATALINK)
     return;
@@ -1966,13 +2255,9 @@ HeterogeneousNodeApp::RunElection ()
   double myScore = CalculateUtilityScore ();
   double now = Simulator::Now ().GetSeconds ();
 
-  // 使用全局 Score 表（泛洪同步），过滤掉超时未更新的节点（视为掉线），保证全子网唯一主备 SPN
-  m_globalScores[selfId] = myScore;
-  m_globalScoreTime[selfId] = now;
+  SpnMergeScoresIntoShared (myScore);
 
   SharedSpnState& shared = s_sharedSpnState[static_cast<uint8_t> (m_subnetType)];
-  shared.scoreByNode[selfId] = myScore;
-  shared.scoreTimeByNode[selfId] = now;
 
   std::vector<std::pair<double, uint32_t>> candidates;
   for (const auto& kv : shared.scoreByNode)
@@ -1984,92 +2269,47 @@ HeterogeneousNodeApp::RunElection ()
   if (candidates.empty ())
     candidates.push_back (std::make_pair (myScore, selfId));
 
-  // 排序：Score 降序，同分则 nodeId 升序，保证全局一致
+  // Score 降序；同分 nodeId 升序，保证确定性
   std::sort (candidates.begin (), candidates.end (),
              [] (const std::pair<double, uint32_t>& a, const std::pair<double, uint32_t>& b) {
                if (a.first != b.first) return a.first > b.first;
                return a.second < b.second;
              });
 
-  std::map<uint32_t, double> aliveScoreById;
-  for (const auto& c : candidates)
-    {
-      aliveScoreById[c.second] = c.first;
-    }
+  uint32_t newPrimary = candidates[0].second;
+  uint32_t newBackup = (candidates.size () >= 2) ? candidates[1].second : newPrimary;
+  double primaryScoreVal = candidates[0].first;
+  double backupScoreVal = (candidates.size () >= 2) ? candidates[1].first : primaryScoreVal;
 
-  uint32_t rawWinnerId = candidates.empty () ? selfId : candidates[0].second;
   bool stateChanged = false;
   std::string changeReason;
 
-  auto pickBackup = [&candidates] (uint32_t spnNodeId) -> uint32_t {
-    for (const auto& c : candidates)
-      {
-        if (c.second != spnNodeId)
-          return c.second;
-      }
-    return spnNodeId;
-  };
+  uint32_t need = (m_subnetType == SUBNET_ADHOC) ? s_expectedAdhocInitialMembers : s_expectedDatalinkInitialMembers;
+  if (need == 0)
+    need = 2;
 
-  // 强约束：
-  // - 首次只选一次主备并锁定
-  // - 仅允许一次退网切换 + 一次低分切换
-  // - 两次事件均发生后冻结，不再重选
   if (!shared.initialized)
     {
-      // 启动预热：先等分数同步，避免启动瞬间竞争
-      if (candidates.size () < 2 && now < SPN_INITIAL_ELECTION_WARMUP_SEC)
-        return;
-      shared.primaryId = rawWinnerId;
-      shared.backupId = pickBackup (shared.primaryId);
+      if (candidates.size () < need && now < SPN_INITIAL_ELECTION_DEADLINE_SEC)
+        {
+          return;
+        }
+      shared.primaryId = newPrimary;
+      shared.backupId = newBackup;
       shared.initialized = true;
       shared.initializedTs = now;
+      shared.stablePhase = true;
       stateChanged = true;
-      changeReason = "initial_lock";
+      changeReason = electReason.empty () ? "init_phase_election" : electReason;
     }
-  else if (!shared.frozen)
+  else
     {
-      const bool eventsEnabled = (now - shared.initializedTs) >= (m_spnScoreStaleSec + 0.5);
-      auto itCommitted = aliveScoreById.find (shared.primaryId);
-      bool committedAlive = (itCommitted != aliveScoreById.end ());
-      double committedScore = committedAlive ? itCommitted->second : 0.0;
-
-      // 事件1：主SPN退网，仅一次（且全仿真仅一次）
-      if (eventsEnabled &&
-          !committedAlive &&
-          !shared.failoverUsed &&
-          !s_globalFailoverUsed)
+      if (newPrimary != shared.primaryId || newBackup != shared.backupId)
         {
-          shared.primaryId = rawWinnerId;
-          shared.backupId = pickBackup (shared.primaryId);
-          shared.failoverUsed = true;
-          s_globalFailoverUsed = true;
+          shared.primaryId = newPrimary;
+          shared.backupId = newBackup;
           stateChanged = true;
-          changeReason = "failover";
-        }
-      // 事件2：主SPN得分低于阈值，仅一次（且全仿真仅一次）
-      else if (eventsEnabled &&
-               committedAlive &&
-               !shared.energySwitchUsed &&
-               !s_globalEnergyUsed &&
-               committedScore < SPN_PRIMARY_SCORE_THRESHOLD &&
-               rawWinnerId != shared.primaryId)
-        {
-          auto itTop = aliveScoreById.find (rawWinnerId);
-          double topScore = (itTop != aliveScoreById.end ()) ? itTop->second : committedScore;
-          if (topScore > committedScore + SPN_SWITCH_HYSTERESIS)
-            {
-              shared.primaryId = rawWinnerId;
-              shared.backupId = pickBackup (shared.primaryId);
-              shared.energySwitchUsed = true;
-              s_globalEnergyUsed = true;
-              stateChanged = true;
-              changeReason = "energy_low";
-            }
-        }
-
-      if (shared.failoverUsed && shared.energySwitchUsed)
-        {
-          shared.frozen = true;
+          changeReason = electReason.empty () ? "stable_full_reselect" : electReason;
         }
     }
 
@@ -2081,6 +2321,25 @@ HeterogeneousNodeApp::RunElection ()
 
   if (m_committedPrimaryId == 0)
     return;
+
+  if (stateChanged)
+    {
+      SpnElectHistoryEntry rec;
+      rec.timeSec = now;
+      rec.primaryId = newPrimary;
+      rec.backupId = newBackup;
+      rec.reason = changeReason;
+      shared.electHistory.push_back (rec);
+      if (shared.electHistory.size () > 200u)
+        {
+          shared.electHistory.erase (shared.electHistory.begin ());
+        }
+    }
+
+  // 记录一次完整选举计算；条件 C 挑战计数在完整重选后清零
+  shared.lastElectTs = now;
+  shared.challengeChallengerId = 0;
+  shared.challengeConsecutive = 0;
 
   uint32_t spnNodeId = m_committedPrimaryId;
   uint32_t backupNodeId = (m_committedBackupId == 0) ? spnNodeId : m_committedBackupId;
@@ -2112,7 +2371,6 @@ HeterogeneousNodeApp::RunElection ()
     {
       if (wasBackup)
         NMS_LOG_INFO (selfId, "SPN_TAKEOVER", std::string ("Node ") + std::to_string (selfId) + " takes over as primary SPN");
-      NMS_LOG_INFO (selfId, "SPN_ELECT", "elected as primary SPN (score=" + std::to_string (myScore) + ")");
       if (!m_flushEvent.IsRunning ())
         m_flushEvent = Simulator::Schedule (m_aggregateInterval,
                                             &HeterogeneousNodeApp::FlushAggregatedToGmc, this);
@@ -2120,13 +2378,7 @@ HeterogeneousNodeApp::RunElection ()
         Simulator::Cancel (m_heartbeatEvent);
       m_heartbeatEvent = Simulator::Schedule (Seconds (HEARTBEAT_SEC),
                                               &HeterogeneousNodeApp::SendHeartbeatSync, this);
-      // 新主上位后立即广播一次主备通告，避免节点视图滞后导致脑裂
-      NMS_LOG_INFO (selfId, "SPN_ANNOUNCE",
-                    "subnet=" + std::to_string (static_cast<uint32_t> (m_subnetType)) +
-                    " primary=" + std::to_string (spnNodeId) +
-                    " backup=" + std::to_string (backupNodeId) +
-                    " reason=takeover_broadcast");
-      SendScoreFlood (myScore);
+      // SPN_ANNOUNCE / Score 泛洪见下方 stateChanged && selfId==newPrimary，避免重复
       if (m_failoverPending)
         {
           double healSec = Simulator::Now ().GetSeconds () - m_failoverStartTs;
@@ -2152,19 +2404,26 @@ HeterogeneousNodeApp::RunElection ()
                                               &HeterogeneousNodeApp::CheckPrimaryHeartbeat, this);
     }
 
-  if (stateChanged)
+  // 仅由新当选的 Primary 发 SPN_ANNOUNCE + Score 泛洪，避免各节点视图写入同一 shared 状态导致日志/前端抖动
+  if (stateChanged && selfId == newPrimary)
     {
       std::ostringstream oss;
       oss << "subnet=" << static_cast<uint32_t> (m_subnetType)
           << " primary=" << spnNodeId
           << " backup=" << backupNodeId
           << " reason=" << changeReason
-          << " failoverUsed=" << (m_failoverSwitchUsed ? 1 : 0)
-          << " energySwitchUsed=" << (m_energySwitchUsed ? 1 : 0);
+          << " primaryScore=" << std::fixed << std::setprecision (3) << primaryScoreVal
+          << " backupScore=" << std::setprecision (3) << backupScoreVal;
       NMS_LOG_INFO (selfId, "SPN_ANNOUNCE", oss.str ());
-      // 子网通报：状态变化时立即发一次 score-flood（携带当前全局视图）
+      const char* subLbl = (m_subnetType == SUBNET_DATALINK) ? "DataLink" : "Adhoc";
+      std::ostringstream spnElect;
+      spnElect << std::fixed << std::setprecision (1) << "t=" << now << "s [SPN_ELECT] SubNet: " << subLbl
+               << "\n  Primary: Node " << spnNodeId << " (score=" << std::setprecision (2) << primaryScoreVal << ")"
+               << "\n  Backup:  Node " << backupNodeId << " (score=" << std::setprecision (2) << backupScoreVal << ")"
+               << "\n  触发原因: " << changeReason
+               << "\n  elected as primary SPN (score=" << std::setprecision (3) << myScore << ")";
+      NMS_LOG_INFO (selfId, "SPN_ELECT", spnElect.str ());
       SendScoreFlood (myScore);
-      // GMC 同步：若本节点已是主 SPN，立即补发一次聚合，避免等待周期定时器
       if (m_isSpn)
         {
           Simulator::Schedule (MilliSeconds (50), &HeterogeneousNodeApp::FlushAggregatedToGmc, this);
@@ -2192,6 +2451,138 @@ HeterogeneousNodeApp::RunElection ()
           m_socketReportBoundAddr = wantAddr;
           m_socketBoundPeerPort = wantPort;
         }
+    }
+
+  SyncConditionCTimer ();
+}
+
+void
+HeterogeneousNodeApp::SpnForgetPeer (uint32_t peerNodeId)
+{
+  m_globalScores.erase (peerNodeId);
+  m_globalScoreTime.erase (peerNodeId);
+  if (m_subnetType == SUBNET_ADHOC || m_subnetType == SUBNET_DATALINK)
+    {
+      SharedSpnState& sh = s_sharedSpnState[static_cast<uint8_t> (m_subnetType)];
+      sh.scoreByNode.erase (peerNodeId);
+      sh.scoreTimeByNode.erase (peerNodeId);
+    }
+}
+
+void
+HeterogeneousNodeApp::EvaluateConditionC ()
+{
+  SharedSpnState& shared = s_sharedSpnState[static_cast<uint8_t> (m_subnetType)];
+  double now = Simulator::Now ().GetSeconds ();
+  uint32_t pid = shared.primaryId;
+  if (pid == 0)
+    {
+      return;
+    }
+  auto itp = shared.scoreByNode.find (pid);
+  double ps = (itp != shared.scoreByNode.end ()) ? itp->second : 0.0;
+  uint32_t bestId = 0;
+  double bestSc = -1.0;
+  for (const auto& kv : shared.scoreByNode)
+    {
+      auto itTime = shared.scoreTimeByNode.find (kv.first);
+      if (itTime == shared.scoreTimeByNode.end ())
+        {
+          continue;
+        }
+      double age = now - itTime->second;
+      if (age > m_spnScoreStaleSec)
+        {
+          continue;
+        }
+      if (kv.first == pid)
+        {
+          continue;
+        }
+      if (kv.second <= ps + SCORE_ELECT_MARGIN)
+        {
+          continue;
+        }
+      if (kv.second > bestSc || (kv.second == bestSc && (bestId == 0 || kv.first < bestId)))
+        {
+          bestSc = kv.second;
+          bestId = kv.first;
+        }
+    }
+  if (bestId == 0)
+    {
+      shared.challengeChallengerId = 0;
+      shared.challengeConsecutive = 0;
+      return;
+    }
+  if (bestId == shared.challengeChallengerId)
+    {
+      shared.challengeConsecutive++;
+    }
+  else
+    {
+      shared.challengeChallengerId = bestId;
+      shared.challengeConsecutive = 1;
+    }
+  if (shared.challengeConsecutive >= CONDITION_C_CONFIRM_PERIODS)
+    {
+      bool intervalOk =
+          (shared.lastElectTs < 0.0) || (now - shared.lastElectTs >= MIN_ELECT_INTERVAL_SEC);
+      if (intervalOk)
+        {
+          RunFullElection ("condition_c_periodic_score_reselect");
+        }
+    }
+}
+
+void
+HeterogeneousNodeApp::OnConditionCEval ()
+{
+  if (!m_running)
+    {
+      return;
+    }
+  if (m_subnetType != SUBNET_ADHOC && m_subnetType != SUBNET_DATALINK)
+    {
+      return;
+    }
+  uint32_t selfId = GetNode ()->GetId ();
+  SharedSpnState& shared = s_sharedSpnState[static_cast<uint8_t> (m_subnetType)];
+  if (!shared.initialized || selfId != shared.primaryId)
+    {
+      return;
+    }
+  double myScore = CalculateUtilityScore ();
+  SpnMergeScoresIntoShared (myScore);
+  EvaluateConditionC ();
+  if (m_running && selfId == shared.primaryId)
+    {
+      m_conditionCTimer = Simulator::Schedule (Seconds (CONDITION_C_PERIOD_SEC),
+                                              &HeterogeneousNodeApp::OnConditionCEval, this);
+    }
+}
+
+void
+HeterogeneousNodeApp::SyncConditionCTimer ()
+{
+  if (m_subnetType != SUBNET_ADHOC && m_subnetType != SUBNET_DATALINK)
+    {
+      return;
+    }
+  if (m_conditionCTimer.IsRunning ())
+    {
+      Simulator::Cancel (m_conditionCTimer);
+    }
+  if (!m_running)
+    {
+      return;
+    }
+  SharedSpnState& shared = s_sharedSpnState[static_cast<uint8_t> (m_subnetType)];
+  uint32_t selfId = GetNode ()->GetId ();
+  if (shared.initialized && selfId == shared.primaryId)
+    {
+      m_conditionCTimer = Simulator::Schedule (Seconds (CONDITION_C_PERIOD_SEC),
+                                              &HeterogeneousNodeApp::OnConditionCEval, this);
     }
 }
 
@@ -2552,6 +2943,10 @@ HeterogeneousNodeApp::StopApplication (void)
     {
       Simulator::Cancel (m_heartbeatEvent);
     }
+  if (m_conditionCTimer.IsRunning ())
+    {
+      Simulator::Cancel (m_conditionCTimer);
+    }
 
   if (m_socket)
     {
@@ -2586,18 +2981,18 @@ HeterogeneousNodeApp::ForceFail ()
 {
   uint32_t nodeId = GetNode ()->GetId ();
   m_uvMib.m_energy = 0.0;
-  NMS_LOG_INFO (nodeId, "EVENT_NODE_FAIL", "Node " + std::to_string (nodeId) + " power exhausted");
+  NMS_LOG_INFO (nodeId, "NODE_OFFLINE", "Node " + std::to_string (nodeId) + " application stopped (OFFLINE)");
   StopApplication ();
 }
 
 void
-HeterogeneousNodeApp::TriggerElectionNow ()
+HeterogeneousNodeApp::TriggerElectionNow (const std::string& electReason)
 {
   if (!m_running || !(m_subnetType == SUBNET_ADHOC || m_subnetType == SUBNET_DATALINK))
     {
       return;
     }
-  RunElection ();
+  RunFullElection (electReason);
 }
 
 uint32_t
@@ -2706,10 +3101,16 @@ HeterogeneousNodeApp::SendPacket ()
   // 2) 计算效用评分 Score
   double myScore = CalculateUtilityScore ();
 
-  // 3) Adhoc/DataLink：动态选举 SPN/备选 SPN，并更新上报目标
+  // 3) Adhoc/DataLink：静默更新分数与本地角色；仅满足条件时触发 RunFullElection（与 STATE_CHANGE 解耦）
   if (m_subnetType == SUBNET_ADHOC || m_subnetType == SUBNET_DATALINK)
     {
-      RunElection ();
+      SpnSyncScoresOnly (myScore);
+      MaybeTriggerSpnElection (myScore);
+      if (!m_initialScoreFloodSent)
+        {
+          m_initialScoreFloodSent = true;
+          Simulator::Schedule (MilliSeconds (100), &HeterogeneousNodeApp::BroadcastScoreFloodCurrent, this);
+        }
     }
 
   // 4) Ad-hoc / DataLink 中广播 Hello（携带 nodeId + Score）
@@ -3169,6 +3570,8 @@ private:
   void BuildDataLinkSubnet ();   ///< 构建子网 C：窄带数据链 (11a 低速率模拟)
   void SetupBackhaul ();         ///< 为每个 SPN 与 GMC 搭建有线 P2P 回程链路
   void ElectInitialSpn ();      ///< 按性能评分选举各子网 SPN（LTE 固定 eNB，Adhoc/DataLink 选举）
+  /// LTE 不参与 RunElection，单独输出 SPN_ANNOUNCE 供可视化解析主/备与 GMC 回程
+  void EmitLteSpnAnnounce ();
   void InstallApplications ();   ///< 在 GMC 与各 SPN 安装自定义应用
   void SetupMonitoring ();       ///< 配置 FlowMonitor 和 NetAnim
   /// 周期性输出业务流窗口性能（FLOW_PERF_WIN），用于前端真实时间序列
@@ -3178,8 +3581,8 @@ private:
   /// 时序入网：t=0 时将 joinTime>0 的节点接口设为 Down，joinTime 时刻再 BringUp
   void BringDownNodesWithDelayedJoin ();
   static void BringUpNode (Ptr<Node> node);
-  /// 事件注入：在指定时刻强制指定节点失效（能量 0、停应用、关网卡），0 表示不注入
-  void InjectNodeFailure (uint32_t nodeId);
+  /// 事件注入：统一退网（NODE_OFFLINE），reasonKey 为 fault|voluntary；GMC 会被忽略
+  void InjectNodeOffline (uint32_t nodeId, std::string reasonKey);
   void StopFlowsRelatedToNode (uint32_t nodeId);
 
   /// 归档目录与时间戳（仿真开始时创建 simulation_results/YYYY-MM-DD_HH-MM-SS 及四类子目录）
@@ -3310,13 +3713,13 @@ HeterogeneousNmsFramework::HeterogeneousNmsFramework ()
   : m_spnLte (0),
     m_spnAdhoc (0),
     m_spnDatalink (0),
-    m_simTimeSeconds (100.0),
+    m_simTimeSeconds (90.0),
     m_adhocTopology (ADHOC_TOPOLOGY_MESH),
     m_enablePacketParse (false),
     m_enablePcap (false),
     m_useDualChannel (false),
-    m_energyDeltaThreshold (0.05),
-    m_stateSuppressWindowSec (1.0),
+    m_energyDeltaThreshold (0.15),
+    m_stateSuppressWindowSec (15.0),
     m_aggregateIntervalSec (2.0),
     m_scenarioMode ("normal"),
     m_defaultAdhocNodes (5),
@@ -3356,23 +3759,60 @@ HeterogeneousNmsFramework::MakeOutputPathInCategory (const std::string& category
 }
 
 void
-HeterogeneousNmsFramework::InjectNodeFailure (uint32_t nodeId)
+HeterogeneousNmsFramework::InjectNodeOffline (uint32_t nodeId, std::string reasonKey)
 {
-  Ptr<Node> node;
-  for (NodeList::Iterator it = NodeList::Begin (); it != NodeList::End (); ++it)
+  uint32_t gmcId = m_gmcNode.Get (0)->GetId ();
+  if (nodeId == gmcId)
     {
-      if ((*it)->GetId () == nodeId)
-        {
-          node = *it;
-          break;
-        }
-    }
-  if (!node)
-    {
-      NmsLog ("WARN", 0, "EVENT_NODE_FAIL", "InjectNodeFailure: node " + std::to_string (nodeId) + " not found");
+      NmsLog ("WARN", 0, "SYSTEM", "NODE_OFFLINE ignored: target is GMC (GMC cannot go offline)");
       return;
     }
-  NmsLog ("INFO", 0, "EVENT_NODE_FAIL", "Node " + std::to_string (nodeId) + " power exhausted");
+  if (reasonKey != "voluntary")
+    {
+      reasonKey = "fault";
+    }
+  Ptr<Node> node = GetNodeById (nodeId);
+  if (!node)
+    {
+      NmsLog ("WARN", 0, "NODE_OFFLINE", "InjectNodeOffline: node " + std::to_string (nodeId) + " not found");
+      return;
+    }
+  const char* reasonZh = (reasonKey == "voluntary") ? "主动退网" : "节点故障";
+  std::string subnetLbl = "—";
+  std::string roleLbl = "—";
+  auto itJ = m_joinConfig.find (nodeId);
+  if (itJ != m_joinConfig.end ())
+    {
+      subnetLbl = itJ->second.subnet;
+      std::string tp = itJ->second.type;
+      if (tp == "enb") roleLbl = "SPN";
+      else if (tp == "ue") roleLbl = "UE";
+      else if (tp == "gmc") roleLbl = "GMC";
+      else roleLbl = "TSN";
+    }
+  uint32_t rem = 0;
+  if (itJ != m_joinConfig.end ())
+    {
+      const std::string sub = itJ->second.subnet;
+      for (const auto& kv : m_joinConfig)
+        {
+          if (kv.second.subnet == sub && kv.first != nodeId && kv.first != gmcId)
+            {
+              ++rem;
+            }
+        }
+    }
+  double tnow = Simulator::Now ().GetSeconds ();
+  {
+    std::ostringstream oss;
+    oss << std::fixed << std::setprecision (1) << "t=" << tnow << "s Node " << nodeId << " 退网 (原因: " << reasonZh << ")";
+    NmsLog ("INFO", nodeId, "NODE_OFFLINE", oss.str ());
+  }
+  {
+    std::ostringstream oss2;
+    oss2 << "所属子网: " << subnetLbl << ", 原角色: " << roleLbl << ", 剩余在网: " << rem;
+    NmsLog ("INFO", nodeId, "NODE_OFFLINE", oss2.str ());
+  }
   StopFlowsRelatedToNode (nodeId);
   for (uint32_t i = 0; i < node->GetNApplications (); ++i)
     {
@@ -3390,8 +3830,6 @@ HeterogeneousNmsFramework::InjectNodeFailure (uint32_t nodeId)
         if (ipv4->IsUp (j))
           ipv4->SetDown (j);
     }
-  NmsLog ("INFO", 0, "EVENT_NODE_OFFLINE_NOTIFY",
-          "node " + std::to_string (nodeId) + " offline notified to all subnets");
   for (NodeList::Iterator it = NodeList::Begin (); it != NodeList::End (); ++it)
     {
       if ((*it)->GetId () == nodeId) continue;
@@ -3400,7 +3838,20 @@ HeterogeneousNmsFramework::InjectNodeFailure (uint32_t nodeId)
           Ptr<HeterogeneousNodeApp> app = DynamicCast<HeterogeneousNodeApp> ((*it)->GetApplication (i));
           if (app)
             {
-              app->TriggerElectionNow ();
+              app->SpnForgetPeer (nodeId);
+              break;
+            }
+        }
+    }
+  for (NodeList::Iterator it = NodeList::Begin (); it != NodeList::End (); ++it)
+    {
+      if ((*it)->GetId () == nodeId) continue;
+      for (uint32_t i = 0; i < (*it)->GetNApplications (); ++i)
+        {
+          Ptr<HeterogeneousNodeApp> app = DynamicCast<HeterogeneousNodeApp> ((*it)->GetApplication (i));
+          if (app)
+            {
+              app->TriggerElectionNow ("spn_peer_offline_reselect");
               break;
             }
         }
@@ -4101,6 +4552,24 @@ HeterogeneousNmsFramework::ElectInitialSpn ()
 }
 
 void
+HeterogeneousNmsFramework::EmitLteSpnAnnounce ()
+{
+  if (!m_spnLte)
+    {
+      return;
+    }
+  const uint32_t primary = m_spnLte->GetId ();
+  // 蜂窝侧无独立备 SPN：backup 与 primary 同 id（与动态子网在无备节点时的处理一致）
+  const uint32_t backup = primary;
+  std::ostringstream oss;
+  oss << "subnet=" << static_cast<uint32_t> (HeterogeneousNodeApp::SUBNET_LTE)
+      << " primary=" << primary
+      << " backup=" << backup
+      << " reason=initial_lock";
+  NmsLog ("INFO", primary, "SPN_ANNOUNCE", oss.str ());
+}
+
+void
 HeterogeneousNmsFramework::InstallApplications ()
 {
   m_businessFlowKeys.clear ();
@@ -4137,10 +4606,30 @@ HeterogeneousNmsFramework::InstallApplications ()
 
   Ipv4Address gmcToLteSpnAddr = m_ifGmcLteSpn.GetAddress (0);
 
+  {
+    uint32_t adhoc0 = 0;
+    for (uint32_t i = 0; i < m_adhocNodes.GetN (); ++i)
+      {
+        if (GetNodeJoinTime (m_adhocNodes.Get (i)->GetId ()) <= 0.0)
+          adhoc0++;
+      }
+    uint32_t dl0 = 0;
+    for (uint32_t i = 0; i < m_datalinkNodes.GetN (); ++i)
+      {
+        if (GetNodeJoinTime (m_datalinkNodes.Get (i)->GetId ()) <= 0.0)
+          dl0++;
+      }
+    HeterogeneousNodeApp::SetExpectedInitialElectionMembers (HeterogeneousNodeApp::SUBNET_ADHOC,
+                                                            std::max (1u, adhoc0));
+    HeterogeneousNodeApp::SetExpectedInitialElectionMembers (HeterogeneousNodeApp::SUBNET_DATALINK,
+                                                            std::max (1u, dl0));
+  }
+
   auto installOne = [&] (Ptr<Node> node, Ipv4Address peerAddr, uint16_t peerPort,
                           HeterogeneousNodeApp::SubnetType st, uint32_t size, Time interval,
                           bool isSpn, Ipv4Address subnetBroadcast, const std::string& nodeOnlineMsg,
-                          Ipv4Address gmcBackhaulAddr = Ipv4Address ("0.0.0.0"), uint16_t gmcBackhaulPort = 0)
+                          Ipv4Address gmcBackhaulAddr = Ipv4Address ("0.0.0.0"), uint16_t gmcBackhaulPort = 0,
+                          bool lteIsEnb = false)
   {
     double startSec = 1.0;
     auto itJoin = m_joinConfig.find (node->GetId ());
@@ -4170,7 +4659,9 @@ HeterogeneousNmsFramework::InstallApplications ()
       app->SetGmcBackhaul (gmcBackhaulAddr, gmcBackhaulPort);
     if (st == HeterogeneousNodeApp::SUBNET_LTE)
       {
-        app->SetInitialUvMib (100.0, 0.9);
+        app->SetLteNodeKind (lteIsEnb);
+        // 与 Adhoc/DataLink 一致：能量为 [0,1] 归一化量，不再使用 *100
+        app->SetInitialUvMib (1.0, 0.9);
       }
     if (itJoin != m_joinConfig.end ())
       {
@@ -4178,7 +4669,7 @@ HeterogeneousNmsFramework::InstallApplications ()
         double e = itJoin->second.initialEnergy >= 0.0 ? itJoin->second.initialEnergy : -1.0;
         double lq = itJoin->second.initialLinkQuality >= 0.0 ? itJoin->second.initialLinkQuality : -1.0;
         if (e >= 0.0 || lq >= 0.0)
-          app->SetInitialUvMib (e >= 0.0 ? ((st == HeterogeneousNodeApp::SUBNET_LTE) ? (e * 100.0) : e) : 0.9,
+          app->SetInitialUvMib (e >= 0.0 ? e : 0.9,
                                 lq >= 0.0 ? lq : 0.85);
       }
     node->AddApplication (app);
@@ -4196,12 +4687,18 @@ HeterogeneousNmsFramework::InstallApplications ()
 
   // ---------- LTE：eNB (SPN) + 所有 UE 均向 GMC 上报（无子网聚合） ----------
   installOne (m_spnLte, gmcToLteSpnAddr, gmcDataPort, HeterogeneousNodeApp::SUBNET_LTE, 200, Seconds (0.5),
-              false, Ipv4Address ("0.0.0.0"), "LTE SPN (eNB) application started.");
+              false, Ipv4Address ("0.0.0.0"), "LTE SPN (eNB) application started.", Ipv4Address ("0.0.0.0"), 0, true);
   for (uint32_t i = 0; i < m_lteUeNodes.GetN (); ++i)
     {
       Ptr<Node> ue = m_lteUeNodes.Get (i);
       installOne (ue, gmcToLteSpnAddr, gmcDataPort, HeterogeneousNodeApp::SUBNET_LTE, 200, Seconds (0.5),
                   false, Ipv4Address ("0.0.0.0"), "LTE UE application started.");
+    }
+  // 在仿真时刻输出（依赖 Simulator::Now），与 Adhoc/DataLink 的 SPN_ANNOUNCE 格式一致，供可视化动态回程
+  if (m_spnLte)
+    {
+      const double lteAnnT = std::max (0.0, GetNodeJoinTime (m_spnLte->GetId ()));
+      Simulator::Schedule (Seconds (lteAnnT), &HeterogeneousNmsFramework::EmitLteSpnAnnounce, this);
     }
 
   // ---------- Adhoc：所有节点初始均非 SPN，peer 为本节点回程 GMC 地址（动态选举后 SPN 向 GMC 上报） ----------
@@ -4449,24 +4946,106 @@ HeterogeneousNmsFramework::WriteAllNodesJsonl ()
     auto it = m_joinConfig.find (nodeId);
     if (it != m_joinConfig.end ())
       {
+        if (it->second.initialEnergy >= 0.0) energy = it->second.initialEnergy;
+        if (it->second.initialLinkQuality >= 0.0) linkQ = it->second.initialLinkQuality;
         if (now < it->second.joinTime)
           {
             joinState = "not_joined";
-            if (it->second.initialEnergy >= 0.0) energy = it->second.initialEnergy;
-            if (it->second.initialLinkQuality >= 0.0) linkQ = it->second.initialLinkQuality;
           }
       }
     Vector pos (0, 0, 0);
     Ptr<MobilityModel> mob = node->GetObject<MobilityModel> ();
     if (mob) pos = mob->GetPosition ();
     std::string ip = GetNodePrimaryIpv4 (node);
+    if (ip.empty () && it != m_joinConfig.end () && !it->second.ipAddress.empty ())
+      {
+        ip = it->second.ipAddress;
+      }
+    Ptr<Ipv4> ipv4 = node->GetObject<Ipv4> ();
+    bool anyIfaceUp = false;
+    if (ipv4)
+      {
+        for (uint32_t i = 1; i < ipv4->GetNInterfaces (); ++i)
+          {
+            if (ipv4->IsUp (i))
+              {
+                anyIfaceUp = true;
+                break;
+              }
+          }
+      }
+    if (ipv4 && ipv4->GetNInterfaces () >= 2 && !anyIfaceUp)
+      {
+        joinState = "offline";
+      }
+
     std::string role;
     for (uint32_t a = 0; a < node->GetNApplications (); ++a)
       {
         Ptr<HeterogeneousNodeApp> app = DynamicCast<HeterogeneousNodeApp> (node->GetApplication (a));
         if (!app) continue;
-        if (app->IsSpn ()) { role = "primary_spn"; break; }
-        if (app->IsBackupSpn ()) role = "standby_spn";
+        if (app->IsApplicationRunning ())
+          {
+            energy = app->GetUvMibEnergy ();
+            linkQ = app->GetUvMibLinkQuality ();
+          }
+        switch (app->GetSubnetType ())
+          {
+          case HeterogeneousNodeApp::SUBNET_ADHOC:
+          case HeterogeneousNodeApp::SUBNET_DATALINK:
+            if (app->IsSpn ())
+              {
+                role = "PRIMARY_SPN";
+              }
+            else if (app->IsBackupSpn ())
+              {
+                role = "BACKUP_SPN";
+              }
+            else
+              {
+                role = "TSN";
+              }
+            break;
+          case HeterogeneousNodeApp::SUBNET_LTE:
+            if (app->IsSpn ())
+              {
+                role = "PRIMARY_SPN";
+              }
+            else
+              {
+                role = "TSN";
+              }
+            break;
+          default:
+            break;
+          }
+        break;
+      }
+    if (role.empty () && it != m_joinConfig.end ())
+      {
+        std::string tp = it->second.type;
+        for (char& c : tp) c = static_cast<char> (::tolower (static_cast<unsigned char> (c)));
+        if (tp == "gmc")
+          {
+            role = "GMC";
+          }
+        else if (tp == "enb")
+          {
+            role = "PRIMARY_SPN";
+          }
+        else if (tp == "ue")
+          {
+            role = "UE";
+          }
+        else
+          {
+            std::string sub = it->second.subnet;
+            for (char& c : sub) c = static_cast<char> (::tolower (static_cast<unsigned char> (c)));
+            if (sub == "adhoc" || sub == "datalink")
+              {
+                role = "TSN";
+              }
+          }
       }
     WriteJsonlStateLine (nodeId, joinState, pos.x, pos.y, pos.z, ip, energy, linkQ, role);
   };
@@ -4588,6 +5167,7 @@ void
 HeterogeneousNmsFramework::Run (double simTimeSeconds)
 {
   m_simTimeSeconds = simTimeSeconds;
+  HeterogeneousNodeApp::ResetSharedElectionState ();
 
   // === 仿真文件多级结构化归档：simulation_results/时间戳 + visualization/performance/log/packet ===
   {
@@ -4654,12 +5234,7 @@ HeterogeneousNmsFramework::Run (double simTimeSeconds)
               + " from " + m_scenarioConfigPath);
       for (const auto& ev : sc.events)
         {
-          if (ev.type == "NODE_FAIL" && ev.target > 0)
-            {
-              Simulator::Schedule (Seconds (ev.time), &HeterogeneousNmsFramework::InjectNodeFailure, this, ev.target);
-              NmsLog ("INFO", 0, "SYSTEM", "Scheduled event NODE_FAIL at t=" + std::to_string (ev.time) + "s target=Node " + std::to_string (ev.target));
-            }
-          else if (ev.type == "SPN_SWITCH" || ev.type == "SPN_FORCE_SWITCH")
+          if (ev.type == "SPN_SWITCH" || ev.type == "SPN_FORCE_SWITCH")
             {
               NmsLog ("WARN", 0, "SYSTEM",
                       "Deprecated event " + ev.type + " ignored: manual SPN target switch is disabled.");
@@ -4675,8 +5250,8 @@ HeterogeneousNmsFramework::Run (double simTimeSeconds)
       m_datalinkRateMode = "OfdmRate6Mbps";
       m_datalinkPacketSize = 120;
       m_datalinkIntervalSec = 0.1; // 约 9.6kbps 应用层负载
-      m_energyDeltaThreshold = 0.05;
-      m_stateSuppressWindowSec = 1.0;
+      m_energyDeltaThreshold = 0.15;
+      m_stateSuppressWindowSec = 15.0;
       m_aggregateIntervalSec = 2.0;
     }
   else if (m_scenarioMode == "compare-baseline")
@@ -4761,6 +5336,34 @@ HeterogeneousNmsFramework::Run (double simTimeSeconds)
   // === 4. 安装自定义应用 ===
   InstallApplications ();
 
+  // === 4.2 场景退网事件（NODE_OFFLINE / 兼容 NODE_FAIL、NODE_LEAVE）：拓扑与 GMC 就绪后调度，禁止 target=GMC ===
+  if (!m_scenarioConfigPath.empty ())
+    {
+      ScenarioConfig scEv = LoadScenarioConfig (m_scenarioConfigPath);
+      uint32_t gmcIdSched = m_gmcNode.Get (0)->GetId ();
+      for (const auto& ev : scEv.events)
+        {
+          bool isOff = (ev.type == "NODE_OFFLINE" || ev.type == "NODE_FAIL" || ev.type == "NODE_LEAVE");
+          if (!isOff || ev.target == 0)
+            continue;
+          if (ev.target == gmcIdSched)
+            {
+              NmsLog ("WARN", 0, "SYSTEM",
+                      "Scenario event ignored: offline target cannot be GMC (node " + std::to_string (gmcIdSched) + ")");
+              continue;
+            }
+          std::string rk = ev.offlineReason;
+          if (rk.empty ())
+            {
+              rk = (ev.type == "NODE_LEAVE") ? "voluntary" : "fault";
+            }
+          Simulator::Schedule (Seconds (ev.time), &HeterogeneousNmsFramework::InjectNodeOffline, this, ev.target, rk);
+          NmsLog ("INFO", 0, "SYSTEM",
+                  "Scheduled NODE_OFFLINE at t=" + std::to_string (ev.time) + "s target=Node " + std::to_string (ev.target)
+                  + " reason=" + rk);
+        }
+    }
+
   // === 4.5 时序入网：joinTime > 0 的节点在 t=0 时接口 Down，joinTime 时刻 Up ===
   if (!m_joinConfig.empty ())
     BringDownNodesWithDelayedJoin ();
@@ -4777,8 +5380,19 @@ HeterogeneousNmsFramework::Run (double simTimeSeconds)
   // === 5.5 事件注入：在指定时刻强制某节点断电（可选，m_failNodeId>0 时生效） ===
   if (m_failNodeId > 0 && m_failTime >= 0)
     {
-      Simulator::Schedule (Seconds (m_failTime), &HeterogeneousNmsFramework::InjectNodeFailure, this, m_failNodeId);
-      NmsLog ("INFO", 0, "SYSTEM", "Event injection: Node " + std::to_string (m_failNodeId) + " will fail at t=" + std::to_string (m_failTime) + "s");
+      uint32_t gmcIdFail = m_gmcNode.Get (0)->GetId ();
+      if (m_failNodeId == gmcIdFail)
+        {
+          NmsLog ("WARN", 0, "SYSTEM", "Event injection ignored: cannot target GMC node " + std::to_string (gmcIdFail));
+        }
+      else
+        {
+          Simulator::Schedule (Seconds (m_failTime), &HeterogeneousNmsFramework::InjectNodeOffline, this, m_failNodeId,
+                                std::string ("fault"));
+          NmsLog ("INFO", 0, "SYSTEM",
+                  "Event injection: NODE_OFFLINE (fault) Node " + std::to_string (m_failNodeId) + " at t="
+                  + std::to_string (m_failTime) + "s");
+        }
     }
 
   // === 6. 仿真控制 ===
@@ -5146,7 +5760,7 @@ HeterogeneousNmsFramework::Run (double simTimeSeconds)
 int
 HnmsMain (int argc, char *argv[])
 {
-  double simTime = 100.0;
+  double simTime = 90.0;
   int adhocTopology = 0;  // 0=MESH, 1=STAR, 2=TREE
   std::string adhocTopologyStr = "mesh";  // 可选：--adhoc-topology=star|tree|mesh
   bool enablePacketParse = false;
@@ -5156,8 +5770,8 @@ HnmsMain (int argc, char *argv[])
   std::string scenarioConfigPath;
   uint32_t failNodeId = 0;   // 事件注入：要断电的节点 ID，0=禁用
   double failTime = 30.0;    // 断电时刻（秒）
-  double energyDeltaThreshold = 0.05;
-  double stateSuppressWindow = 1.0;
+  double energyDeltaThreshold = 0.15;
+  double stateSuppressWindow = 15.0;
   double aggregateInterval = 2.0;
   std::string scenarioMode = "normal";
   uint32_t rngSeed = 1;

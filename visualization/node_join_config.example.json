@@ -1,0 +1,7 @@
+[
+  {"node_id": 0, "type": "GMC", "subnet": "LTE", "join_time": 0.0, "init_pos": [0, 0, 50], "speed": 0},
+  {"node_id": 1, "type": "SPN", "subnet": "TSN", "join_time": 1.2, "init_pos": [100, 200, 50], "speed": 5},
+  {"node_id": 2, "type": "SPN", "subnet": "Adhoc", "join_time": 0.5, "init_pos": [150, 250, 50], "speed": 3},
+  {"node_id": 3, "type": "普通", "subnet": "Adhoc", "join_time": 0.8, "init_pos": [200, 180, 50], "speed": 4},
+  {"node_id": 4, "type": "普通", "subnet": "LTE", "join_time": 1.0, "init_pos": [80, 120, 50], "speed": 2}
+]

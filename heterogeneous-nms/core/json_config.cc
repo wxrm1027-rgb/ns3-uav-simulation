@@ -193,6 +193,7 @@ LoadScenarioConfig (const std::string& path)
               ev.target = 0;
               ev.triggerNodeId = 0;
               ev.newSpnNodeId = 0;
+              ev.offlineReason = "";
               size_t tPos = obj.find ("\"time\"");
               if (tPos != std::string::npos)
                 {
@@ -229,6 +230,14 @@ LoadScenarioConfig (const std::string& path)
               // 兼容字段：trigger_node 未给时回退 target
               if (ev.triggerNodeId == 0)
                 ev.triggerNodeId = ev.target;
+              size_t reasonPos = obj.find ("\"reason\"");
+              if (reasonPos != std::string::npos)
+                {
+                  size_t q1 = obj.find ('"', obj.find (':', reasonPos) + 1);
+                  size_t q2 = obj.find ('"', q1 + 1);
+                  if (q1 != std::string::npos && q2 != std::string::npos)
+                    ev.offlineReason = obj.substr (q1 + 1, q2 - q1 - 1);
+                }
               if (!ev.type.empty ()) out.events.push_back (ev);
               pos = objEnd + 1;
             }

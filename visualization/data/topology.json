@@ -1,0 +1,312 @@
+{
+  "nodes": [
+    {
+      "id": 0,
+      "label": "GMC",
+      "role": "GMC",
+      "subnet": "gmc",
+      "x": 0.0,
+      "y": 0.0,
+      "joinTime": 0.0,
+      "speed": 0.0,
+      "ip": "10.100.0.1",
+      "energy": 1.0,
+      "link_quality": 0.95
+    },
+    {
+      "id": 1,
+      "label": "Node-1",
+      "role": "BACKUP_SPN",
+      "subnet": "adhoc",
+      "x": 100.0,
+      "y": 100.0,
+      "joinTime": 0.0,
+      "speed": 0.0,
+      "ip": "10.1.0.1",
+      "energy": 0.4,
+      "link_quality": 0.565
+    },
+    {
+      "id": 2,
+      "label": "SPN-2",
+      "role": "PRIMARY_SPN",
+      "subnet": "adhoc",
+      "x": 110.0,
+      "y": 100.0,
+      "joinTime": 0.0,
+      "speed": 0.0,
+      "ip": "10.1.0.2",
+      "energy": 0.4,
+      "link_quality": 0.897
+    },
+    {
+      "id": 3,
+      "label": "Node-3",
+      "role": "BACKUP_SPN",
+      "subnet": "adhoc",
+      "x": 105.0,
+      "y": 105.0,
+      "joinTime": 5.0,
+      "speed": 0.0,
+      "offlineTime": 75.0,
+      "ip": "10.1.0.3",
+      "energy": 0.95,
+      "link_quality": 0.95
+    },
+    {
+      "id": 4,
+      "label": "Node-4",
+      "role": "BACKUP_SPN",
+      "subnet": "adhoc",
+      "x": 100.0,
+      "y": 110.0,
+      "joinTime": 0.0,
+      "speed": 0.0,
+      "offlineTime": 60.0,
+      "ip": "10.1.0.4",
+      "energy": 0.85,
+      "link_quality": 0.9
+    },
+    {
+      "id": 5,
+      "label": "Node-5",
+      "role": "TSN",
+      "subnet": "adhoc",
+      "x": 110.0,
+      "y": 110.0,
+      "joinTime": 0.0,
+      "speed": 0.0,
+      "ip": "10.1.0.5",
+      "energy": 0.4,
+      "link_quality": 0.811
+    },
+    {
+      "id": 6,
+      "label": "SPN-6",
+      "role": "TSN",
+      "subnet": "datalink",
+      "x": 220.0,
+      "y": 20.0,
+      "joinTime": 0.0,
+      "speed": 15.0,
+      "ip": "10.2.0.1",
+      "energy": 0.4,
+      "link_quality": 0.928
+    },
+    {
+      "id": 7,
+      "label": "Node-7",
+      "role": "TSN",
+      "subnet": "datalink",
+      "x": 245.0,
+      "y": 30.0,
+      "joinTime": 0.0,
+      "speed": 16.0,
+      "ip": "10.2.0.2",
+      "energy": 0.4,
+      "link_quality": 0.968
+    },
+    {
+      "id": 8,
+      "label": "Node-8",
+      "role": "PRIMARY_SPN",
+      "subnet": "datalink",
+      "x": 270.0,
+      "y": 20.0,
+      "joinTime": 0.0,
+      "speed": 17.0,
+      "ip": "10.2.0.3",
+      "energy": 0.4,
+      "link_quality": 0.922
+    },
+    {
+      "id": 9,
+      "label": "Node-9",
+      "role": "BACKUP_SPN",
+      "subnet": "datalink",
+      "x": 295.0,
+      "y": 30.0,
+      "joinTime": 0.0,
+      "speed": 18.0,
+      "ip": "10.2.0.4",
+      "energy": 0.4,
+      "link_quality": 0.916
+    },
+    {
+      "id": 10,
+      "label": "SPN-10",
+      "role": "TSN",
+      "subnet": "lte",
+      "x": 50.0,
+      "y": 50.0,
+      "joinTime": 0.0,
+      "speed": 0.0,
+      "ip": "10.0.0.5",
+      "energy": 0.996,
+      "link_quality": 0.99
+    },
+    {
+      "id": 11,
+      "label": "Node-11",
+      "role": "BACKUP_SPN",
+      "subnet": "lte",
+      "x": 10.0,
+      "y": 10.0,
+      "joinTime": 0.0,
+      "speed": 0.0,
+      "ip": "7.0.0.2",
+      "energy": 0.876,
+      "link_quality": 0.923
+    },
+    {
+      "id": 12,
+      "label": "Node-12",
+      "role": "TSN",
+      "subnet": "lte",
+      "x": 25.0,
+      "y": 25.0,
+      "joinTime": 10.0,
+      "speed": 0.0,
+      "ip": "7.0.0.3",
+      "energy": 0.946,
+      "link_quality": 1.0
+    },
+    {
+      "id": 13,
+      "label": "Node-13",
+      "role": "TSN",
+      "subnet": "lte",
+      "x": 40.0,
+      "y": 10.0,
+      "joinTime": 12.0,
+      "speed": 0.0,
+      "ip": "7.0.0.4",
+      "energy": 0.876,
+      "link_quality": 0.884
+    },
+    {
+      "id": 14,
+      "label": "Node-14",
+      "role": "TSN",
+      "subnet": "lte",
+      "x": 55.0,
+      "y": 25.0,
+      "joinTime": 14.0,
+      "speed": 0.0,
+      "ip": "7.0.0.5",
+      "energy": 0.876,
+      "link_quality": 0.898
+    },
+    {
+      "id": 15,
+      "label": "Node-15",
+      "role": "TSN",
+      "subnet": "lte",
+      "x": 85.0,
+      "y": 35.0,
+      "joinTime": 16.0,
+      "speed": 0.0,
+      "ip": "7.0.0.6",
+      "energy": 0.876,
+      "link_quality": 0.858
+    }
+  ],
+  "links": [
+    {
+      "from": 1,
+      "to": 2,
+      "type": "data",
+      "t": 0.0
+    },
+    {
+      "from": 2,
+      "to": 3,
+      "type": "data",
+      "t": 5.0
+    },
+    {
+      "from": 2,
+      "to": 5,
+      "type": "data",
+      "t": 0.0
+    },
+    {
+      "from": 3,
+      "to": 4,
+      "type": "data",
+      "t": 5.0
+    },
+    {
+      "from": 2,
+      "to": 4,
+      "type": "data",
+      "t": 0.0
+    },
+    {
+      "from": 6,
+      "to": 7,
+      "type": "data",
+      "t": 0.0
+    },
+    {
+      "from": 7,
+      "to": 8,
+      "type": "data",
+      "t": 0.0
+    },
+    {
+      "from": 8,
+      "to": 9,
+      "type": "data",
+      "t": 0.0
+    },
+    {
+      "from": 10,
+      "to": 11,
+      "type": "data",
+      "t": 0.0
+    },
+    {
+      "from": 10,
+      "to": 12,
+      "type": "data",
+      "t": 10.0
+    },
+    {
+      "from": 10,
+      "to": 13,
+      "type": "data",
+      "t": 12.0
+    },
+    {
+      "from": 10,
+      "to": 14,
+      "type": "data",
+      "t": 14.0
+    },
+    {
+      "from": 10,
+      "to": 15,
+      "type": "data",
+      "t": 16.0
+    },
+    {
+      "from": 0,
+      "to": 10,
+      "type": "backhaul",
+      "t": 0.0
+    },
+    {
+      "from": 0,
+      "to": 2,
+      "type": "backhaul",
+      "t": 0.0
+    },
+    {
+      "from": 0,
+      "to": 6,
+      "type": "backhaul",
+      "t": 0.0
+    }
+  ]
+}

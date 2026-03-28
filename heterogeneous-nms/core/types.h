@@ -21,6 +21,8 @@ struct ScenarioEvent
   uint32_t target;
   uint32_t triggerNodeId;
   uint32_t newSpnNodeId;
+  /// 退网原因：fault | voluntary（与 NODE_OFFLINE 配合；空则按 type 推断）
+  std::string offlineReason;
 };
 
 struct BusinessFlowConfig

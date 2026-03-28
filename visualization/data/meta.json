@@ -1,0 +1,5 @@
+{
+  "flowmonXml": "/home/wxr/ns-3-dev/simulation_results/2026-03-28_21-58-38/performance/flowmon_stats_2026-03-28_21-58-38.xml",
+  "stateDrivenKpiJson": "/home/wxr/ns-3-dev/simulation_results/2026-03-28_21-58-38/performance/state-driven-kpi-summary_2026-03-28_21-58-38.json",
+  "eventsCount": 4200
+}
