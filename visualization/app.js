@@ -328,6 +328,22 @@
           offlineMarkers.push({ t: e.t, nodeId: nid0 });
         }
       }
+      if (e.event === 'SYSTEM' && /Triggered NODE_FAIL/i.test(d)) {
+        var mNf = d.match(/on Node\s*(\d+)/i);
+        var mRs = d.match(/reason=([A-Za-z_]+)/);
+        if (mNf) {
+          var nidF = parseInt(mNf[1], 10);
+          touchOffline(nidF, e.t);
+          offlineMarkers.push({ t: e.t, nodeId: nidF });
+          if (mRs) {
+            var R = mRs[1];
+            if (R === 'ENERGY_DEPLETED') offlineReasonText[nidF] = '能量耗尽（ENERGY_DEPLETED）';
+            else if (R === 'LINK_QUALITY_DEGRADED') offlineReasonText[nidF] = '链路质量退化（LINK_QUALITY_DEGRADED）';
+            else if (R === 'DIRECT_FAIL') offlineReasonText[nidF] = '直接退网（DIRECT_FAIL）';
+            else offlineReasonText[nidF] = R;
+          }
+        }
+      }
       if (e.event === 'NODE_OFFLINE' && /退网/.test(d)) {
         var nid = Number(e.nodeId);
         touchOffline(nid, e.t);

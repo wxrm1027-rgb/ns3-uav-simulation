@@ -17,12 +17,16 @@ struct TrajectoryPoint
 struct ScenarioEvent
 {
   double time;
+  double injectTime; ///< 注入时刻（秒），<0 表示未配置（回退用 time）
   std::string type;
   uint32_t target;
   uint32_t triggerNodeId;
   uint32_t newSpnNodeId;
   /// 退网原因：fault | voluntary（与 NODE_OFFLINE 配合；空则按 type 推断）
   std::string offlineReason;
+  double injectedEnergy;      ///< NODE_ENERGY_FAIL
+  double injectedLinkQuality;   ///< LINK_INTERFERENCE_FAIL
+  double threshold;           ///< 能量或链路监测阈值
 };
 
 struct BusinessFlowConfig

@@ -8,6 +8,28 @@
 #include <set>
 #include <sstream>
 
+namespace {
+
+bool
+ParseJsonNumberIfKey (const std::string& obj, const char* key, double& out)
+{
+  std::string pat = std::string ("\"") + key + "\"";
+  size_t p = obj.find (pat);
+  if (p == std::string::npos)
+    {
+      return false;
+    }
+  size_t colon = obj.find (':', p);
+  if (colon == std::string::npos)
+    {
+      return false;
+    }
+  out = std::strtod (obj.c_str () + colon + 1, nullptr);
+  return true;
+}
+
+} // namespace
+
 std::map<uint32_t, NodeJoinConfig>
 LoadNodeJoinConfig (const std::string& path)
 {
@@ -190,10 +212,14 @@ LoadScenarioConfig (const std::string& path)
               std::string obj = content.substr (objStart, objEnd - objStart + 1);
               ScenarioEvent ev = {};
               ev.time = 0.0;
+              ev.injectTime = -1.0;
               ev.target = 0;
               ev.triggerNodeId = 0;
               ev.newSpnNodeId = 0;
               ev.offlineReason = "";
+              ev.injectedEnergy = -1.0;
+              ev.injectedLinkQuality = -1.0;
+              ev.threshold = -1.0;
               size_t tPos = obj.find ("\"time\"");
               if (tPos != std::string::npos)
                 {
@@ -238,6 +264,25 @@ LoadScenarioConfig (const std::string& path)
                   if (q1 != std::string::npos && q2 != std::string::npos)
                     ev.offlineReason = obj.substr (q1 + 1, q2 - q1 - 1);
                 }
+              {
+                double tmpD = 0.0;
+                if (ParseJsonNumberIfKey (obj, "inject_time", tmpD))
+                  {
+                    ev.injectTime = tmpD;
+                  }
+                if (ParseJsonNumberIfKey (obj, "injected_energy", tmpD))
+                  {
+                    ev.injectedEnergy = tmpD;
+                  }
+                if (ParseJsonNumberIfKey (obj, "injected_link_quality", tmpD))
+                  {
+                    ev.injectedLinkQuality = tmpD;
+                  }
+                if (ParseJsonNumberIfKey (obj, "threshold", tmpD))
+                  {
+                    ev.threshold = tmpD;
+                  }
+              }
               if (!ev.type.empty ()) out.events.push_back (ev);
               pos = objEnd + 1;
             }

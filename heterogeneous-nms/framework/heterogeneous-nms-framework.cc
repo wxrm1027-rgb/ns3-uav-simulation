@@ -26,7 +26,10 @@
 #include "ns3/ipv4-list-routing-helper.h"
 #include "ns3/ipv4-static-routing-helper.h"
 #include "ns3/flow-monitor-module.h"
+#include "ns3/traffic-control-module.h"
+#include "ns3/traffic-control-layer.h"
 #include "ns3/applications-module.h"
+#include "ns3/onoff-application.h"
 #include "ns3/node-list.h"
 #include "ns3/propagation-loss-model.h"
 
@@ -47,6 +50,7 @@
 #include <sstream>
 #include <string>
 #include <vector>
+#include <limits>
 #include <cstdlib>
 #include <cerrno>
 #include <sys/stat.h>
@@ -86,6 +90,10 @@ NmsLog (const char* level, uint32_t nodeId, const char* eventType, const std::st
 }
 #else
 #include "../core/logger.h"
+#include "../core/config_loader.h"
+#include "../core/event_scheduler.h"
+#include "../core/structured_log.h"
+#include "../core/state_manager.h"
 #endif
 
 #define NMS_LOG_INFO(nodeId, eventType, details)  NmsLog ("INFO",  nodeId, eventType, details)
@@ -315,16 +323,69 @@ GetNodePrimaryIpv4 (Ptr<Node> node)
   return "";
 }
 
+/// 解析 scenario events 对象中的数值字段（键存在时写入 out）
+static bool
+ParseJsonNumberIfKey (const std::string& obj, const char* key, double& out)
+{
+  std::string pat = std::string ("\"") + key + "\"";
+  size_t p = obj.find (pat);
+  if (p == std::string::npos)
+    {
+      return false;
+    }
+  size_t colon = obj.find (':', p);
+  if (colon == std::string::npos)
+    {
+      return false;
+    }
+  out = std::strtod (obj.c_str () + colon + 1, nullptr);
+  return true;
+}
+
+/// 解析 scenario events 对象中的字符串字段
+static bool
+ParseJsonStringIfKey (const std::string& obj, const char* key, std::string& out)
+{
+  std::string pat = std::string ("\"") + key + "\"";
+  size_t p = obj.find (pat);
+  if (p == std::string::npos)
+    {
+      return false;
+    }
+  size_t colon = obj.find (':', p);
+  if (colon == std::string::npos)
+    {
+      return false;
+    }
+  size_t q1 = obj.find ('"', colon + 1);
+  if (q1 == std::string::npos)
+    {
+      return false;
+    }
+  size_t q2 = obj.find ('"', q1 + 1);
+  if (q2 == std::string::npos)
+    {
+      return false;
+    }
+  out = obj.substr (q1 + 1, q2 - q1 - 1);
+  return true;
+}
+
 // ====================== 场景想定模块（扩展接口） ======================
 struct TrajectoryPoint { double t; double x, y, z; };
 /// 事件定义：由 scenario_config.json 的 events 数组解析
 struct ScenarioEvent
 {
-  double time;        ///< 触发时刻（秒）
+  double time;        ///< 触发时刻（秒）；NODE_OFFLINE/NODE_FAIL 用；物理注入可与 inject_time 对齐
+  double injectTime;  ///< 注入时刻（秒），<0 表示未配置（回退用 time）
   std::string type;   ///< 如 "NODE_FAIL"
   uint32_t target;    ///< 目标节点 ID（如 NODE_FAIL 时）
   uint32_t triggerNodeId; ///< 触发节点 ID（SPN_SWITCH）
   uint32_t newSpnNodeId;  ///< 新主 SPN 节点 ID（SPN_SWITCH）
+  std::string offlineReason; ///< NODE_OFFLINE 等：reason 字段
+  double injectedEnergy;       ///< NODE_ENERGY_FAIL
+  double injectedLinkQuality;  ///< LINK_INTERFERENCE_FAIL
+  double threshold;            ///< 监测阈值（依 type 解释）
 };
 struct BusinessFlowConfig
 {
@@ -346,6 +407,8 @@ struct ScenarioConfig
   std::vector<std::string> eventRules;
   std::vector<ScenarioEvent> events;  ///< 事件列表（NODE_FAIL 等），由 C++ 定时触发
   std::vector<BusinessFlowConfig> businessFlows; ///< 业务流配置
+  double spnElectionTimeoutSec{0.0};       ///< 根级 spn_election_timeout（可选）
+  uint32_t spnHeartbeatMissThreshold{0}; ///< 根级 spn_heartbeat_miss_threshold（可选）
 };
 static ScenarioConfig LoadScenarioConfig (const std::string& path)
 {
@@ -365,6 +428,17 @@ static ScenarioConfig LoadScenarioConfig (const std::string& path)
       if (q != std::string::npos && q2 != std::string::npos)
         out.scenarioId = content.substr (q + 1, q2 - q - 1);
     }
+  {
+    double tmpD = 0.0;
+    if (ParseJsonNumberIfKey (content, "spn_election_timeout", tmpD))
+      {
+        out.spnElectionTimeoutSec = tmpD;
+      }
+    if (ParseJsonNumberIfKey (content, "spn_heartbeat_miss_threshold", tmpD))
+      {
+        out.spnHeartbeatMissThreshold = static_cast<uint32_t> (tmpD + 0.5);
+      }
+  }
   // 解析 "events": [ {"time": 30, "type": "NODE_FAIL", "target": 2}, ... ]
   size_t eventsPos = content.find ("\"events\"");
   if (eventsPos != std::string::npos)
@@ -423,6 +497,30 @@ static ScenarioConfig LoadScenarioConfig (const std::string& path)
                   if (colon != std::string::npos)
                     ev.newSpnNodeId = static_cast<uint32_t> (atoi (obj.c_str () + colon + 1));
                 }
+              ev.injectTime = -1.0;
+              ev.injectedEnergy = -1.0;
+              ev.injectedLinkQuality = -1.0;
+              ev.threshold = -1.0;
+              {
+                double tmpD = 0.0;
+                ParseJsonStringIfKey (obj, "reason", ev.offlineReason);
+                if (ParseJsonNumberIfKey (obj, "inject_time", tmpD))
+                  {
+                    ev.injectTime = tmpD;
+                  }
+                if (ParseJsonNumberIfKey (obj, "injected_energy", tmpD))
+                  {
+                    ev.injectedEnergy = tmpD;
+                  }
+                if (ParseJsonNumberIfKey (obj, "injected_link_quality", tmpD))
+                  {
+                    ev.injectedLinkQuality = tmpD;
+                  }
+                if (ParseJsonNumberIfKey (obj, "threshold", tmpD))
+                  {
+                    ev.threshold = tmpD;
+                  }
+              }
               if (ev.triggerNodeId == 0)
                 ev.triggerNodeId = ev.target;
               if (!ev.type.empty ())
@@ -1166,6 +1264,9 @@ public:
 
   /// 设置入网初始 UV-MIB（由 joinconfig 注入；energy/linkQuality 在 [0,1]，<0 表示不覆盖）
   void SetInitialUvMib (double energy, double linkQuality);
+  /// 场景事件：在 inject_time 强制写入能量/链路质量（不触发退网）
+  void ApplyScenarioInjectEnergy (double energy);
+  void ApplyScenarioInjectLinkQuality (double linkQuality);
   /// LTE：区分 eNB / UE 以采用不同 Score 权重（仅 SUBNET_LTE 有效）
   void SetLteNodeKind (bool isEnb);
 
@@ -1805,6 +1906,20 @@ HeterogeneousNodeApp::SetInitialUvMib (double energy, double linkQuality)
     }
   if (linkQuality >= 0.0 && linkQuality <= 1.0)
     m_uvMib.m_linkQuality = linkQuality;
+}
+
+void
+HeterogeneousNodeApp::ApplyScenarioInjectEnergy (double energy)
+{
+  double e = std::min (1.0, std::max (0.0, energy));
+  m_uvMib.m_energy = e;
+  m_uvMib.m_lastReportedEnergy = e;
+}
+
+void
+HeterogeneousNodeApp::ApplyScenarioInjectLinkQuality (double linkQuality)
+{
+  m_uvMib.m_linkQuality = std::min (1.0, std::max (0.0, linkQuality));
 }
 
 void
@@ -4085,6 +4200,25 @@ GmcPolicySenderApp::SendPolicy (void)
  *  - 若评估希望仅提升控制包优先级而不改端口，可替代方案：在发送控制包时设置 IP TOS/DSCP 字段。
  *===================================================================================*/
 
+/**
+ * 将 scenario 中 business_flows.priority 映射为 IPv4 TOS 字节（高 6 位为 DSCP<<2）。
+ * ns-3 中 UdpSocket 根据 TOS 计算 SocketPriority，并打上 SocketPriorityTag；PfifoFastQueueDisc
+ * 按优先级选择 band（band 0 最先出队）。数值越大（>=2）表示业务越重要。
+ */
+static uint8_t
+MapBusinessPriorityToIpTos (uint8_t businessPriority)
+{
+  if (businessPriority >= 2)
+    {
+      return 0x10; // -> NS3_PRIO_INTERACTIVE -> PfifoFast band 0
+    }
+  if (businessPriority == 1)
+    {
+      return 0x48; // -> NS3_PRIO_BULK -> band 2
+    }
+  return 0xb8; // -> NS3_PRIO_INTERACTIVE_BULK -> band 1
+}
+
 class HeterogeneousNmsFramework
 {
 public:
@@ -4118,6 +4252,8 @@ public:
   void SetStateSuppressWindow (double v) { if (v >= 0.0) m_stateSuppressWindowSec = v; }
   void SetAggregateIntervalSec (double v) { if (v > 0.0) m_aggregateIntervalSec = v; }
   void SetScenarioMode (const std::string& mode) { m_scenarioMode = mode; }
+  /// InstallApplications 前：由 config.json 注入 SPN 选举超时与心跳丢失阈值（默认与构造函数一致；scenario_config 仍可在 Run 内覆盖）
+  void SetFrameworkSpnElectionTunables (double electionTimeoutSec, uint8_t heartbeatMissThreshold);
 
 private:
   // === 分步骤方法 ===
@@ -4139,7 +4275,14 @@ private:
   void BringDownNodesWithDelayedJoin ();
   static void BringUpNode (Ptr<Node> node);
   /// 事件注入：统一退网（NODE_OFFLINE），reasonKey 为 fault|voluntary；GMC 会被忽略
-  void InjectNodeOffline (uint32_t nodeId, std::string reasonKey);
+  /// systemReason：ENERGY_DEPLETED / LINK_QUALITY_DEGRADED / DIRECT_FAIL（空则不打 SYSTEM 行）
+  void InjectNodeOffline (uint32_t nodeId, std::string reasonKey,
+                          const std::string& systemReason = std::string (),
+                          double logEnergy = -1.0, double logLinkQ = -1.0, double logThreshold = -1.0);
+  void ScenarioInjectEnergy (uint32_t nodeId, double energy);
+  void ScenarioInjectLinkQuality (uint32_t nodeId, double linkQ);
+  void OnPhysicsMonitorTick ();
+  void LogMemberNodeLostOnSubnetPrimary (uint32_t lostNodeId);
   void StopFlowsRelatedToNode (uint32_t nodeId);
 
   /// 归档目录与时间戳（仿真开始时创建 simulation_results/YYYY-MM-DD_HH-MM-SS 及四类子目录）
@@ -4163,6 +4306,8 @@ private:
   double GetNodeJoinTime (uint32_t nodeId) const;
   /// 业务流路径追踪：构建 Adhoc 子网 nodeId <-> Ipv4Address 映射（在拓扑与 IP 分配完成后调用）
   void BuildAdhocAddressMap ();
+  /// 业务 UDP 流 QoS：在 WiFi/LTE UE 网卡上安装 PfifoFast，并按 priority 设置 IP TOS（映射到 SocketPriority / DSCP）
+  void InstallBusinessFlowQosQueueDiscs ();
   /// 通过 OLSR 路由表解析 src -> dst 的逐跳路径（仅 Adhoc 子网）
   std::vector<uint32_t> GetOlsrPath (uint32_t srcNodeId, uint32_t dstNodeId) const;
   /// 根据节点 ID 获取 Ptr<Node>（遍历 NodeList）
@@ -4251,6 +4396,22 @@ private:
   std::map<uint32_t, FlowWindowSnapshot> m_flowWindowPrev; ///< FlowMonitor flowId -> 上一窗口快照
   double m_flowPerfWindowSec; ///< 窗口统计周期（秒）
 
+  /// NODE_ENERGY_FAIL / LINK_INTERFERENCE_FAIL：周期监测（每 1s）
+  enum class PhysicsWatchKind
+  {
+    ENERGY,
+    LINK
+  };
+  struct PhysicsWatchEntry
+  {
+    uint32_t target;
+    PhysicsWatchKind kind;
+    double threshold;
+    bool done;
+  };
+  std::vector<PhysicsWatchEntry> m_physicsWatches;
+  std::map<uint32_t, std::string> m_nodeOfflineSystemReason; ///< JSONL offline_reason
+
   /// 事件注入：在 m_failTime 秒时强制节点 m_failNodeId 失效（0 表示不注入）
   uint32_t            m_failNodeId;     ///< 要断电的节点 ID，0 = 禁用
   double              m_failTime;       ///< 断电时刻（秒）
@@ -4298,6 +4459,19 @@ HeterogeneousNmsFramework::~HeterogeneousNmsFramework ()
 {
 }
 
+void
+HeterogeneousNmsFramework::SetFrameworkSpnElectionTunables (double electionTimeoutSec, uint8_t heartbeatMissThreshold)
+{
+  if (electionTimeoutSec > 0.0)
+    {
+      m_spnElectionTimeoutSec = electionTimeoutSec;
+    }
+  if (heartbeatMissThreshold >= 1u)
+    {
+      m_spnHeartbeatMissThreshold = heartbeatMissThreshold;
+    }
+}
+
 /// 生成归档路径：m_outputDir + baseName + _ + m_timestamp + ext（兼容旧调用，写入 performance）
 std::string
 HeterogeneousNmsFramework::MakeOutputPath (const std::string& baseName, const std::string& ext) const
@@ -4342,8 +4516,180 @@ OfflineReasonKeyToZh (const std::string& rk)
 } // namespace
 
 void
-HeterogeneousNmsFramework::InjectNodeOffline (uint32_t nodeId, std::string reasonKey)
+HeterogeneousNmsFramework::LogMemberNodeLostOnSubnetPrimary (uint32_t lostNodeId)
 {
+  auto itLost = m_joinConfig.find (lostNodeId);
+  if (itLost == m_joinConfig.end ())
+    {
+      return;
+    }
+  const std::string sub = itLost->second.subnet;
+  uint32_t logOn = std::numeric_limits<uint32_t>::max ();
+  for (NodeList::Iterator it = NodeList::Begin (); it != NodeList::End (); ++it)
+    {
+      uint32_t nid = (*it)->GetId ();
+      auto j = m_joinConfig.find (nid);
+      if (j == m_joinConfig.end () || j->second.subnet != sub)
+        {
+          continue;
+        }
+      for (uint32_t i = 0; i < (*it)->GetNApplications (); ++i)
+        {
+          Ptr<HeterogeneousNodeApp> ap = DynamicCast<HeterogeneousNodeApp> ((*it)->GetApplication (i));
+          if (ap && ap->IsSpn () && !ap->IsBackupSpn ())
+            {
+              logOn = nid;
+              break;
+            }
+        }
+      if (logOn != std::numeric_limits<uint32_t>::max ())
+        {
+          break;
+        }
+    }
+  if (logOn == std::numeric_limits<uint32_t>::max ())
+    {
+      for (const auto& kv : m_joinConfig)
+        {
+          if (kv.second.subnet != sub)
+            {
+              continue;
+            }
+          std::string tp = kv.second.type;
+          for (char& c : tp)
+            c = static_cast<char> (std::tolower (static_cast<unsigned char> (c)));
+          if (tp == "enb")
+            {
+              logOn = kv.first;
+              break;
+            }
+        }
+    }
+  if (logOn != std::numeric_limits<uint32_t>::max ())
+    {
+      NmsLog ("INFO", logOn, "SPN",
+              std::string ("member_node_lost node=") + std::to_string (lostNodeId));
+    }
+}
+
+void
+HeterogeneousNmsFramework::ScenarioInjectEnergy (uint32_t nodeId, double energy)
+{
+  Ptr<Node> node = GetNodeById (nodeId);
+  if (!node)
+    {
+      return;
+    }
+  for (uint32_t i = 0; i < node->GetNApplications (); ++i)
+    {
+      Ptr<HeterogeneousNodeApp> app = DynamicCast<HeterogeneousNodeApp> (node->GetApplication (i));
+      if (app)
+        {
+          app->ApplyScenarioInjectEnergy (energy);
+          std::ostringstream o;
+          o << "injected_energy=" << std::fixed << std::setprecision (2) << energy;
+          NmsLog ("INFO", nodeId, "SCENARIO_INJECT", o.str ());
+          return;
+        }
+    }
+}
+
+void
+HeterogeneousNmsFramework::ScenarioInjectLinkQuality (uint32_t nodeId, double linkQ)
+{
+  Ptr<Node> node = GetNodeById (nodeId);
+  if (!node)
+    {
+      return;
+    }
+  for (uint32_t i = 0; i < node->GetNApplications (); ++i)
+    {
+      Ptr<HeterogeneousNodeApp> app = DynamicCast<HeterogeneousNodeApp> (node->GetApplication (i));
+      if (app)
+        {
+          app->ApplyScenarioInjectLinkQuality (linkQ);
+          std::ostringstream o;
+          o << "injected_link_quality=" << std::fixed << std::setprecision (2) << linkQ;
+          NmsLog ("INFO", nodeId, "SCENARIO_INJECT", o.str ());
+          return;
+        }
+    }
+}
+
+void
+HeterogeneousNmsFramework::OnPhysicsMonitorTick ()
+{
+  double now = Simulator::Now ().GetSeconds ();
+  for (auto& w : m_physicsWatches)
+    {
+      if (w.done)
+        {
+          continue;
+        }
+      Ptr<Node> n = GetNodeById (w.target);
+      if (!n)
+        {
+          w.done = true;
+          continue;
+        }
+      Ptr<HeterogeneousNodeApp> hap;
+      for (uint32_t i = 0; i < n->GetNApplications (); ++i)
+        {
+          hap = DynamicCast<HeterogeneousNodeApp> (n->GetApplication (i));
+          if (hap)
+            {
+              break;
+            }
+        }
+      if (!hap || !hap->IsApplicationRunning ())
+        {
+          continue;
+        }
+      const double e = hap->GetUvMibEnergy ();
+      const double lq = hap->GetUvMibLinkQuality ();
+      bool trip = false;
+      if (w.kind == PhysicsWatchKind::ENERGY && e < w.threshold)
+        {
+          trip = true;
+        }
+      if (w.kind == PhysicsWatchKind::LINK && lq < w.threshold)
+        {
+          trip = true;
+        }
+      if (!trip)
+        {
+          continue;
+        }
+      w.done = true;
+      if (w.kind == PhysicsWatchKind::ENERGY)
+        {
+          std::ostringstream ot;
+          ot << "reason=ENERGY_BELOW_THRESHOLD energy=" << std::fixed << std::setprecision (2) << e
+             << " threshold=" << std::setprecision (2) << w.threshold;
+          NmsLog ("INFO", w.target, "EVENT_TRIGGER", ot.str ());
+          InjectNodeOffline (w.target, "power_low", "ENERGY_DEPLETED", e, -1.0, w.threshold);
+        }
+      else
+        {
+          std::ostringstream ot;
+          ot << "linkQ=" << std::fixed << std::setprecision (2) << lq << " threshold=" << std::setprecision (2)
+             << w.threshold << " → TRIGGERING NODE_FAIL";
+          NmsLog ("INFO", w.target, "LINK_DEGRADE", ot.str ());
+          InjectNodeOffline (w.target, "link_loss", "LINK_QUALITY_DEGRADED", -1.0, lq, w.threshold);
+        }
+    }
+  if (now + 1.0 <= m_simTimeSeconds)
+    {
+      Simulator::Schedule (Seconds (1.0), &HeterogeneousNmsFramework::OnPhysicsMonitorTick, this);
+    }
+}
+
+void
+HeterogeneousNmsFramework::InjectNodeOffline (uint32_t nodeId, std::string reasonKey,
+                                              const std::string& systemReason,
+                                              double logEnergy, double logLinkQ, double logThreshold)
+{
+  (void) logThreshold;
   uint32_t gmcId = m_gmcNode.Get (0)->GetId ();
   if (nodeId == gmcId)
     {
@@ -4358,6 +4704,39 @@ HeterogeneousNmsFramework::InjectNodeOffline (uint32_t nodeId, std::string reaso
     {
       NmsLog ("WARN", 0, "NODE_OFFLINE", "InjectNodeOffline: node " + std::to_string (nodeId) + " not found");
       return;
+    }
+  Ptr<HeterogeneousNodeApp> targetApp;
+  for (uint32_t i = 0; i < node->GetNApplications (); ++i)
+    {
+      targetApp = DynamicCast<HeterogeneousNodeApp> (node->GetApplication (i));
+      if (targetApp)
+        {
+          break;
+        }
+    }
+  bool triggerFullReselect = false;
+  if (targetApp)
+    {
+      HeterogeneousNodeApp::SubnetType st = targetApp->GetSubnetType ();
+      if (st == HeterogeneousNodeApp::SUBNET_ADHOC || st == HeterogeneousNodeApp::SUBNET_DATALINK)
+        {
+          triggerFullReselect = targetApp->IsSpn () || targetApp->IsBackupSpn ();
+        }
+    }
+  if (!systemReason.empty ())
+    {
+      m_nodeOfflineSystemReason[nodeId] = systemReason;
+      std::ostringstream sys;
+      sys << "Triggered NODE_FAIL on Node " << nodeId << " reason=" << systemReason;
+      if (systemReason == "ENERGY_DEPLETED" && logEnergy >= 0.0)
+        {
+          sys << " energy=" << std::fixed << std::setprecision (2) << logEnergy;
+        }
+      if (systemReason == "LINK_QUALITY_DEGRADED" && logLinkQ >= 0.0)
+        {
+          sys << " linkQ=" << std::fixed << std::setprecision (2) << logLinkQ;
+        }
+      NmsLog ("INFO", 0, "SYSTEM", sys.str ());
     }
   const char* reasonZh = OfflineReasonKeyToZh (rk);
   std::string subnetLbl = "—";
@@ -4425,18 +4804,25 @@ HeterogeneousNmsFramework::InjectNodeOffline (uint32_t nodeId, std::string reaso
             }
         }
     }
-  for (NodeList::Iterator it = NodeList::Begin (); it != NodeList::End (); ++it)
+  if (triggerFullReselect)
     {
-      if ((*it)->GetId () == nodeId) continue;
-      for (uint32_t i = 0; i < (*it)->GetNApplications (); ++i)
+      for (NodeList::Iterator it = NodeList::Begin (); it != NodeList::End (); ++it)
         {
-          Ptr<HeterogeneousNodeApp> app = DynamicCast<HeterogeneousNodeApp> ((*it)->GetApplication (i));
-          if (app)
+          if ((*it)->GetId () == nodeId) continue;
+          for (uint32_t i = 0; i < (*it)->GetNApplications (); ++i)
             {
-              app->TriggerElectionNow ("spn_peer_offline_reselect");
-              break;
+              Ptr<HeterogeneousNodeApp> app = DynamicCast<HeterogeneousNodeApp> ((*it)->GetApplication (i));
+              if (app)
+                {
+                  app->TriggerElectionNow ("spn_peer_offline_reselect");
+                  break;
+                }
             }
         }
+    }
+  else
+    {
+      LogMemberNodeLostOnSubnetPrimary (nodeId);
     }
 }
 
@@ -4928,6 +5314,44 @@ HeterogeneousNmsFramework::BuildAdhocAddressMap ()
       m_adhocAddressToNodeId[addr] = nid;
       m_adhocNodeIdToAddress[nid] = addr;
     }
+}
+
+void
+HeterogeneousNmsFramework::InstallBusinessFlowQosQueueDiscs ()
+{
+  NetDeviceContainer qosDevs;
+  if (m_adhocDevs.GetN () > 0)
+    {
+      qosDevs.Add (m_adhocDevs);
+    }
+  if (m_datalinkDevs.GetN () > 0)
+    {
+      qosDevs.Add (m_datalinkDevs);
+    }
+  if (m_lteUeDevs.GetN () > 0)
+    {
+      qosDevs.Add (m_lteUeDevs);
+    }
+  if (qosDevs.GetN () == 0)
+    {
+      return;
+    }
+  for (uint32_t i = 0; i < qosDevs.GetN (); ++i)
+    {
+      Ptr<NetDevice> dev = qosDevs.Get (i);
+      Ptr<TrafficControlLayer> tc = dev->GetNode ()->GetObject<TrafficControlLayer> ();
+      if (tc && tc->GetRootQueueDiscOnDevice (dev))
+        {
+          tc->DeleteRootQueueDiscOnDevice (dev);
+        }
+    }
+  TrafficControlHelper tch;
+  tch.SetRootQueueDisc ("ns3::PfifoFastQueueDisc",
+                        "MaxSize", QueueSizeValue (QueueSize ("1000p")));
+  tch.Install (qosDevs);
+  NmsLog ("INFO", 0, "QOS_TC",
+          "PfifoFastQueueDisc installed on " + std::to_string (qosDevs.GetN ())
+              + " devices (Adhoc/DataLink/LTE-UE wireless stacks).");
 }
 
 std::vector<uint32_t>
@@ -5469,6 +5893,26 @@ HeterogeneousNmsFramework::InstallApplications ()
       double stagger = static_cast<double> (fcfg.flowId % 5) * 0.05; // avoid synchronized burst starts
       clientApps.Start (Seconds (fcfg.startTime + stagger));
       clientApps.Stop (Seconds (stopAt));
+      {
+        const uint8_t ipTos = MapBusinessPriorityToIpTos (fcfg.priority);
+        Ptr<OnOffApplication> onOffApp = DynamicCast<OnOffApplication> (clientApps.Get (0));
+        const double tosAt = fcfg.startTime + stagger + 0.0001;
+        Simulator::Schedule (Seconds (tosAt), [onOffApp, ipTos, fcfg] () {
+            if (!onOffApp)
+              {
+                return;
+              }
+            Ptr<Socket> sk = onOffApp->GetSocket ();
+            if (sk)
+              {
+                sk->SetIpTos (ipTos);
+              }
+            std::ostringstream qoss;
+            qoss << "flowId=" << fcfg.flowId << " ipTos=0x" << std::hex << static_cast<unsigned> (ipTos)
+                 << std::dec << " priority=" << static_cast<uint32_t> (fcfg.priority);
+            NmsLog ("INFO", fcfg.srcNodeId, "FLOW_QOS", qoss.str ());
+          });
+      }
       if (fcfg.flowId == 5)
         {
           Simulator::Schedule (Seconds (fcfg.startTime + 0.2),
@@ -5676,7 +6120,14 @@ HeterogeneousNmsFramework::WriteAllNodesJsonl ()
               }
           }
       }
-    WriteJsonlStateLine (nodeId, joinState, pos.x, pos.y, pos.z, ip, energy, linkQ, role, chExtra.str ());
+    std::string offlineExtra;
+    auto itOr = m_nodeOfflineSystemReason.find (nodeId);
+    if (itOr != m_nodeOfflineSystemReason.end ())
+      {
+        offlineExtra = ",\"offline_reason\":\"" + itOr->second + "\"";
+      }
+    WriteJsonlStateLine (nodeId, joinState, pos.x, pos.y, pos.z, ip, energy, linkQ, role,
+                         chExtra.str () + offlineExtra);
   };
   // 必须写入所有节点组（含 LTE UE），否则日志只有 12 个节点、缺 12,13,14,15
   for (uint32_t i = 0; i < m_gmcNode.GetN (); ++i) writeOne (m_gmcNode.Get (i));
@@ -5962,16 +6413,77 @@ HeterogeneousNmsFramework::Run (double simTimeSeconds)
   // 注意：LTE UE -> GMC 需 PGW 有到 10.100.0.0/24 的路由；EPC 内部未配置时 UE->GMC 可能不通，
   // Adhoc/DataLink 到 GMC 为直连，不受影响。若需全局自动路由，可排查 GlobalRouter 与 LTE 兼容性后再启用 PopulateRoutingTables()。
 
+  // === 3.9 业务流区分服务：在无线网卡上安装 PfifoFast（依赖 SocketPriorityTag；见 InstallApplications 中 SetIpTos） ===
+  InstallBusinessFlowQosQueueDiscs ();
+
   // === 4. 安装自定义应用 ===
   InstallApplications ();
 
-  // === 4.2 场景退网事件（NODE_OFFLINE / 兼容 NODE_FAIL、NODE_LEAVE）：拓扑与 GMC 就绪后调度，禁止 target=GMC ===
+  // === 4.2 场景事件：NODE_OFFLINE/NODE_FAIL 直接退网；NODE_ENERGY_FAIL/LINK_INTERFERENCE_FAIL 先注入再周期监测 ===
   if (!m_scenarioConfigPath.empty ())
     {
       ScenarioConfig scEv = LoadScenarioConfig (m_scenarioConfigPath);
       uint32_t gmcIdSched = m_gmcNode.Get (0)->GetId ();
       for (const auto& ev : scEv.events)
         {
+          if (ev.type == "NODE_ENERGY_FAIL")
+            {
+              if (ev.target == 0 || ev.target == gmcIdSched)
+                {
+                  NmsLog ("WARN", 0, "SYSTEM", "NODE_ENERGY_FAIL ignored: invalid target");
+                  continue;
+                }
+              if (ev.injectedEnergy < 0.0 || ev.threshold < 0.0)
+                {
+                  NmsLog ("WARN", 0, "SYSTEM",
+                          "NODE_ENERGY_FAIL ignored: need injected_energy and threshold (node "
+                          + std::to_string (ev.target) + ")");
+                  continue;
+                }
+              double tInj = (ev.injectTime >= 0.0) ? ev.injectTime : ev.time;
+              const uint32_t tgt = ev.target;
+              const double injE = ev.injectedEnergy;
+              Simulator::Schedule (Seconds (tInj), [this, tgt, injE] () { ScenarioInjectEnergy (tgt, injE); });
+              PhysicsWatchEntry w;
+              w.target = ev.target;
+              w.kind = PhysicsWatchKind::ENERGY;
+              w.threshold = ev.threshold;
+              w.done = false;
+              m_physicsWatches.push_back (w);
+              NmsLog ("INFO", 0, "SYSTEM",
+                      "Scheduled NODE_ENERGY_FAIL inject at t=" + std::to_string (tInj) + "s target=Node "
+                      + std::to_string (ev.target) + " threshold=" + std::to_string (ev.threshold));
+              continue;
+            }
+          if (ev.type == "LINK_INTERFERENCE_FAIL")
+            {
+              if (ev.target == 0 || ev.target == gmcIdSched)
+                {
+                  NmsLog ("WARN", 0, "SYSTEM", "LINK_INTERFERENCE_FAIL ignored: invalid target");
+                  continue;
+                }
+              if (ev.injectedLinkQuality < 0.0 || ev.threshold < 0.0)
+                {
+                  NmsLog ("WARN", 0, "SYSTEM",
+                          "LINK_INTERFERENCE_FAIL ignored: need injected_link_quality and threshold (node "
+                          + std::to_string (ev.target) + ")");
+                  continue;
+                }
+              double tInj = (ev.injectTime >= 0.0) ? ev.injectTime : ev.time;
+              const uint32_t tgt = ev.target;
+              const double injQ = ev.injectedLinkQuality;
+              Simulator::Schedule (Seconds (tInj), [this, tgt, injQ] () { ScenarioInjectLinkQuality (tgt, injQ); });
+              PhysicsWatchEntry w;
+              w.target = ev.target;
+              w.kind = PhysicsWatchKind::LINK;
+              w.threshold = ev.threshold;
+              w.done = false;
+              m_physicsWatches.push_back (w);
+              NmsLog ("INFO", 0, "SYSTEM",
+                      "Scheduled LINK_INTERFERENCE_FAIL inject at t=" + std::to_string (tInj) + "s target=Node "
+                      + std::to_string (ev.target) + " threshold=" + std::to_string (ev.threshold));
+              continue;
+            }
           bool isOff = (ev.type == "NODE_OFFLINE" || ev.type == "NODE_FAIL" || ev.type == "NODE_LEAVE");
           if (!isOff || ev.target == 0)
             continue;
@@ -5986,10 +6498,17 @@ HeterogeneousNmsFramework::Run (double simTimeSeconds)
             {
               rk = (ev.type == "NODE_LEAVE") ? "voluntary" : "fault";
             }
-          Simulator::Schedule (Seconds (ev.time), &HeterogeneousNmsFramework::InjectNodeOffline, this, ev.target, rk);
+          const double tOff = ev.time;
+          Simulator::Schedule (Seconds (tOff), [this, ev, rk] () {
+            InjectNodeOffline (ev.target, rk, std::string ("DIRECT_FAIL"), -1.0, -1.0, -1.0);
+          });
           NmsLog ("INFO", 0, "SYSTEM",
-                  "Scheduled NODE_OFFLINE at t=" + std::to_string (ev.time) + "s target=Node " + std::to_string (ev.target)
+                  "Scheduled NODE_OFFLINE at t=" + std::to_string (tOff) + "s target=Node " + std::to_string (ev.target)
                   + " reason=" + rk);
+        }
+      if (!m_physicsWatches.empty ())
+        {
+          Simulator::Schedule (Seconds (1.0), &HeterogeneousNmsFramework::OnPhysicsMonitorTick, this);
         }
     }
 
@@ -6016,8 +6535,11 @@ HeterogeneousNmsFramework::Run (double simTimeSeconds)
         }
       else
         {
-          Simulator::Schedule (Seconds (m_failTime), &HeterogeneousNmsFramework::InjectNodeOffline, this, m_failNodeId,
-                                std::string ("fault"));
+          const uint32_t fnid = m_failNodeId;
+          const double ft = m_failTime;
+          Simulator::Schedule (Seconds (ft), [this, fnid] () {
+            InjectNodeOffline (fnid, std::string ("fault"), std::string ("DIRECT_FAIL"), -1.0, -1.0, -1.0);
+          });
           NmsLog ("INFO", 0, "SYSTEM",
                   "Event injection: NODE_OFFLINE (fault) Node " + std::to_string (m_failNodeId) + " at t="
                   + std::to_string (m_failTime) + "s");
@@ -6405,6 +6927,8 @@ HnmsMain (int argc, char *argv[])
   std::string scenarioMode = "normal";
   uint32_t rngSeed = 1;
   uint32_t rngRun = 1;
+  std::string hnmsConfigPath;
+  int jsonLogFlag = 0;
 
   CommandLine cmd;
   cmd.AddValue ("simTime", "Simulation time in seconds", simTime);
@@ -6423,7 +6947,40 @@ HnmsMain (int argc, char *argv[])
   cmd.AddValue ("scenarioMode", "Scenario mode: normal|thesis30|compare-baseline|compare-hnmp", scenarioMode);
   cmd.AddValue ("rngSeed", "Global RNG seed for reproducible experiments", rngSeed);
   cmd.AddValue ("rngRun", "RNG run index for repeated trials", rngRun);
+  cmd.AddValue ("config", "Path to hnms config.json (spn/node/link/qos/simulation); empty=search defaults",
+                  hnmsConfigPath);
+  cmd.AddValue ("jsonLog", "1=emit structured JSON log lines via StructuredLog", jsonLogFlag);
   cmd.Parse (argc, argv);
+
+#ifdef HNMS_USE_MODULES
+  if (hnmsConfigPath.empty ())
+    {
+      std::ifstream c0 ("config.json");
+      if (c0)
+        {
+          hnmsConfigPath = "config.json";
+          c0.close ();
+        }
+      else
+        {
+          std::ifstream c1 ("docs/heterogeneous-nms/config.json");
+          if (c1)
+            {
+              hnmsConfigPath = "docs/heterogeneous-nms/config.json";
+              c1.close ();
+            }
+        }
+    }
+  hnms::ConfigLoader::LoadFromFile (hnmsConfigPath);
+  hnms::StructuredLog::SetJsonEnabled (jsonLogFlag != 0);
+  hnms::EventScheduler::Instance ().SetGlobalMaxRetry (5);
+  {
+    std::ostringstream o;
+    o << "config=" << (hnmsConfigPath.empty () ? "(defaults)" : hnmsConfigPath)
+      << " jsonLog=" << jsonLogFlag;
+    NmsLog ("INFO", 0, "HNMS_ARCH", o.str ());
+  }
+#endif
 
   // 未指定 joinConfig 时尝试默认路径，确保 JSON 中设计的节点数（如 16 节点、5 个 LTE UE）生效
   if (joinConfigPath.empty ())
@@ -6458,6 +7015,14 @@ HnmsMain (int argc, char *argv[])
   if (!joinConfigPath.empty ()) framework.SetJoinConfigPath (joinConfigPath);
   if (!scenarioConfigPath.empty ()) framework.SetScenarioConfigPath (scenarioConfigPath);
   if (failNodeId > 0) { framework.SetFailNodeId (failNodeId); framework.SetFailTime (failTime); }
+#ifdef HNMS_USE_MODULES
+  // 命令行已覆盖的参数（能量阈值/抑制窗口/聚合周期等）不再读 config；此处仅注入无 CLI 对应项的 SPN 参数（默认与构造函数一致）
+  {
+    uint32_t hb = hnms::ConfigLoader::SpnHeartbeatMissThreshold ();
+    uint8_t hbu = static_cast<uint8_t> (std::min (255u, std::max (1u, hb)));
+    framework.SetFrameworkSpnElectionTunables (hnms::ConfigLoader::SpnElectionWaitTime (), hbu);
+  }
+#endif
   framework.Run (simTime);
 
   return 0;

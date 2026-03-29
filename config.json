@@ -1,0 +1,24 @@
+{
+  "spn": {
+    "election_wait_time": 2.0,
+    "hello_interval": 0.5,
+    "suppress_window": 2.0,
+    "heartbeat_miss_threshold": 3
+  },
+  "node": {
+    "battery_threshold_low": 0.2,
+    "speed_max": 50
+  },
+  "link": {
+    "snr_threshold_connect": 10.0,
+    "snr_threshold_disconnect": 5.0
+  },
+  "qos": {
+    "max_latency_ms": 100,
+    "min_throughput_mbps": 10
+  },
+  "simulation": {
+    "total_time": 100.0,
+    "num_nodes": 30
+  }
+}

@@ -3,6 +3,11 @@ set(source_files
   framework/heterogeneous-nms-framework.cc
   core/logger.cc
   core/json_config.cc
+  core/config_loader.cc
+  core/state_manager.cc
+  core/structured_log.cc
+  core/event_scheduler.cc
+  core/sim_event.cc
   protocol/hnmp.cc
   protocol/tlv.cc
   protocol/packet-parse.cc
