@@ -14,6 +14,8 @@
     adhoc: '#00a050',
     /** 自组网：纯簇首*/
     clusterHead: '#22c55e',
+    /** Adhoc 簇首金色光环（描边），与 SPN 橙色描边分层绘制 */
+    chHaloGold: '#d4af37',
     datalink: '#e6b800',
     offline: '#606060',
     /** 统一退网节点填充（与 fill-opacity 0.5 配合） */
@@ -22,6 +24,39 @@
     notJoined: '#7a8fa3',
     other: '#808080'
   };
+
+  /** 拓扑/导出里 role 可能为 GMC（大写），勿仅用 === 'gmc' */
+  function isGmcNode(node) {
+    if (!node) return false;
+    if (Number(node.id) === 0) return true;
+    if ((node.subnet || '').toLowerCase() === 'gmc') return true;
+    return String(node.role || '').toLowerCase() === 'gmc';
+  }
+
+  /**
+   * 节点「可视为已入网」的最早时刻（秒）。
+   * 优先使用 events 里 NODE_ONLINE / NODE_UP（与 nms-framework-log 一致）；无则回退 topology 的 joinTime。
+   */
+  function resolveJoinTimeSec(node) {
+    if (!node) return 0;
+    var oid = Number(node.id);
+    var jev = state.joinTimeFromEvents != null ? state.joinTimeFromEvents[oid] : null;
+    if (jev != null && !isNaN(jev) && isFinite(jev)) return jev;
+    var v = node.joinTime != null ? node.joinTime : node.join_time;
+    if (v === '' || v == null) return 0;
+    var n = Number(v);
+    return isNaN(n) ? 0 : n;
+  }
+
+  /**
+   * 当前仿真时刻（秒）一律转为 number。
+   * 若混入字符串，则 `t + 1e-9` 会变成字符串拼接；`"10" < "5"` 会按字典序错误为 true，导致节点长期显示待入网。
+   */
+  function timelineSec(t) {
+    var n = Number(t);
+    if (isNaN(n) || !isFinite(n)) return 0;
+    return n;
+  }
 
   /** 时间轴在「仿真未启动」区间：仅显示 GMC，不显示链路与其余节点（与 t>0 的 join 回放区分） */
   var SIM_INITIAL_EPS = 1e-6;
@@ -51,6 +86,8 @@
     topologyDrag: { start: null, panStart: null },
     /** 节点详情悬浮面板打开时对应的节点 id，用于时间轴步进时刷新面板 */
     nodeDetailNodeId: null,
+    /** 由 events 解析：NODE_ONLINE / NODE_UP 的最早时刻（与仿真日志一致，优先于 topology.joinTime） */
+    joinTimeFromEvents: null,
     /** 由 events 解析：NODE_OFFLINE 时刻与原因摘要，供入网状态与拓扑联动 */
     offlineEventIndex: null,
     /** 首次加载 topology 时的 id -> { ip, role }，用于 IP/角色兜底（故障后导出缺字段时） */
@@ -99,7 +136,7 @@
   /** 在网节点：优先 stats 状态，否则 topology；空则从首次快照恢复并打 warn */
   function resolveDisplayIp(node) {
     ensureInitialTopologySnapshot();
-    var st = getNodeStateAtTime(node.id, state.currentTime);
+    var st = getNodeStateAtTime(node.id, timelineSec(state.currentTime));
     var ip = (st && st.ip) || node.ip;
     if (!ip && state.initialTopologyById && state.initialTopologyById[node.id]) {
       var fb = state.initialTopologyById[node.id].ip;
@@ -128,6 +165,71 @@
       evMax = Math.max.apply(null, state.events.map(function (e) { return e.t; }));
     }
     return Math.max(TIMELINE_DEFAULT_MAX_SEC, evMax);
+  }
+
+  /** 加载 topology/events/stats 后的统一刷新（时间轴从 0s 开始，与仿真起点一致） */
+  function refreshAfterVisualizationLoad() {
+    setTime(0);
+    updateCharts();
+    updateBusinessFlowList();
+    if (chartBusinessEl && chartBusinessEl.classList.contains('active')) {
+      requestAnimationFrame(function () {
+        updateCharts();
+        if (chartBusinessRadarEl) { var ch = echarts.getInstanceByDom(chartBusinessRadarEl); if (ch) ch.resize(); }
+        if (chartBusinessLinkQEl) { var lq = echarts.getInstanceByDom(chartBusinessLinkQEl); if (lq) lq.resize(); }
+      });
+    }
+    if (nodeDetailContent) { nodeDetailContent.innerHTML = '<span class="empty">点击拓扑中的节点查看详情</span>'; nodeDetailContent.classList.add('empty'); }
+  }
+
+  function fetchJsonNoStore(path) {
+    return fetch(path, { cache: 'no-store' }).then(function (r) { return r.ok ? r.json() : null; });
+  }
+
+  function applyHttpVisualizationPayload(arr, baseForPath) {
+    if (!arr[0] || !arr[1] || !arr[2]) return false;
+    var rp = document.getElementById('resultPath');
+    if (baseForPath && rp) rp.value = baseForPath;
+    state.topology = arr[0];
+    state._topologySnapshotDone = false;
+    state.initialTopologyById = null;
+    state.events = arr[1];
+    state.stats = arr[2];
+    state.nodeStatesAtTime = (arr[2] && arr[2].nodeStatesByTime) ? arr[2].nodeStatesByTime : null;
+    state.businessFlows = (arr[2] && arr[2].businessFlows) ? arr[2].businessFlows : [];
+    state.businessFeatures = (arr[2] && arr[2].businessFeatures) ? arr[2].businessFeatures : [];
+    state.flowPerformance = (arr[2] && arr[2].flowPerformance) ? arr[2].flowPerformance : [];
+    state.networkRadarMetrics = (arr[2] && arr[2].networkRadarMetrics) ? arr[2].networkRadarMetrics : {};
+    state.networkRadarCosts = (arr[2] && arr[2].networkRadarCosts) ? arr[2].networkRadarCosts : {};
+    state.stateDrivenKpi = (arr[2] && arr[2].stateDrivenKpi) ? arr[2].stateDrivenKpi : {};
+    state.selectedFlowIds = {};
+    state.businessFlows.forEach(function (f) { state.selectedFlowIds[f.id] = true; });
+    refreshAfterVisualizationLoad();
+    return true;
+  }
+
+  /**
+   * @param {string[]} candidates 依次尝试的目录前缀（如 data、visualization/data）
+   * @param {object} [options] silent: true 时不弹窗（用于页面打开时自动加载）
+   */
+  function tryLoadVisualizationHttp(candidates, idx, options) {
+    var silent = options && options.silent;
+    if (idx >= candidates.length) {
+      if (!silent) {
+        alert('加载失败：请确认已执行导出命令并检查路径。\n建议命令：python3 export_visualization_data.py simulation_results/时间戳 -o visualization/data');
+      }
+      return;
+    }
+    var base = candidates[idx];
+    Promise.all([
+      fetchJsonNoStore(base + '/topology.json'),
+      fetchJsonNoStore(base + '/events.json'),
+      fetchJsonNoStore(base + '/stats.json')
+    ]).then(function (arr) {
+      if (!applyHttpVisualizationPayload(arr, base)) {
+        tryLoadVisualizationHttp(candidates, idx + 1, options);
+      }
+    }).catch(function () { tryLoadVisualizationHttp(candidates, idx + 1, options); });
   }
 
   function updateTimelineChrome() {
@@ -172,17 +274,27 @@
   }
 
   function isInitialTimelineState(t) {
-    return t <= SIM_INITIAL_EPS;
+    return timelineSec(t) <= SIM_INITIAL_EPS;
   }
 
   /**
    * 从 events + 拓扑 joinTime 解析 NODE_OFFLINE（兼容旧日志 NODE_FAIL / SYSTEM 调度行）
+   * 须在首段扫描 NODE_ONLINE/NODE_UP 写入 state.joinTimeFromEvents，供 resolveJoinTimeSec 与仿真日志对齐。
    */
   function rebuildOfflineEventIndex() {
     var events = state.events || [];
+    var joinFromEv = {};
+    for (var ji = 0; ji < events.length; ji++) {
+      var ej = events[ji];
+      if (ej.event !== 'NODE_ONLINE' && ej.event !== 'NODE_UP') continue;
+      var nidJ = Number(ej.nodeId);
+      var tj = timelineSec(ej.t);
+      if (joinFromEv[nidJ] == null || tj < joinFromEv[nidJ]) joinFromEv[nidJ] = tj;
+    }
+    state.joinTimeFromEvents = joinFromEv;
     var joinMap = {};
     (state.topology.nodes || []).forEach(function (n) {
-      joinMap[n.id] = n.joinTime != null ? n.joinTime : 0;
+      joinMap[n.id] = resolveJoinTimeSec(n);
     });
     var offlineTime = {};
     var offlineReasonText = {};
@@ -200,8 +312,12 @@
         var ms = d.match(/target=Node\s*(\d+)/i);
         if (ms) {
           var n0 = parseInt(ms[1], 10);
-          touchOffline(n0, e.t);
-          offlineMarkers.push({ t: e.t, nodeId: n0 });
+          // 调度行常在 t=0 打印，退网实际时刻在 details 的「at t=60.000000s」，勿用 e.t
+          var mAt = d.match(/at\s*t\s*=\s*([\d.]+)/i);
+          var tOff = mAt != null ? timelineSec(mAt[1]) : timelineSec(e.t);
+          if (isNaN(tOff) || !isFinite(tOff)) tOff = timelineSec(e.t);
+          touchOffline(n0, tOff);
+          offlineMarkers.push({ t: tOff, nodeId: n0 });
         }
       }
       if (e.event === 'SYSTEM' && /Executing event NODE_FAIL target=Node\s*(\d+)/i.test(d)) {
@@ -216,12 +332,18 @@
         var nid = Number(e.nodeId);
         touchOffline(nid, e.t);
         offlineMarkers.push({ t: e.t, nodeId: nid });
-        if (/主动退网/.test(d)) offlineReasonText[nid] = '主动退网（内部 voluntary）';
-        else if (/节点故障/.test(d)) offlineReasonText[nid] = '节点故障（内部 fault）';
+        if (/主动退网/.test(d)) offlineReasonText[nid] = '主动退网（voluntary）';
+        else if (/电量过低/.test(d)) offlineReasonText[nid] = '电量过低（power_low）';
+        else if (/链路干扰/.test(d)) offlineReasonText[nid] = '链路干扰/断链（link_loss）';
+        else if (/节点故障/.test(d)) offlineReasonText[nid] = '节点故障（fault）';
       }
       if (e.event === 'NODE_JOIN') {
         var nidJ = Number(e.nodeId);
         if (rejoinTime[nidJ] == null || e.t > rejoinTime[nidJ]) rejoinTime[nidJ] = e.t;
+      }
+      // NODE_DOWN：待入网/接口未起，不得计入 NODE_OFFLINE 退网时间轴
+      if (e.event === 'NODE_DOWN') {
+        /* 故意不 touchOffline */
       }
     }
     state.offlineEventIndex = {
@@ -244,19 +366,29 @@
   }
 
   /**
-   * 入网状态：未入网 | 已入网 | 已退网（NODE_OFFLINE 统一，不对 fault/voluntary 做视觉区分）
+   * 入网状态：未入网 | 已入网 | 已退网（NODE_OFFLINE；退网原因见 offlineReasonText）
+   * 优先 topology 的 joinTime：t >= joinTime 即视为已过入网时刻；不再被 JSONL 中滞后的 pending_join 卡住。
+   * 无 joinTime（jt===0）时，才用 JSONL join_state 辅助「待入网」。
+   * GMC 始终视为在网（不采用 JSONL pending）。
    */
   function getNodeNetworkStatus(node, t) {
+    var ts = timelineSec(t);
     var oid = Number(node.id);
-    var jt = node.joinTime != null ? node.joinTime : 0;
-    if (t < jt) {
-      return { kind: 'not_joined', label: '未入网', color: '#888888' };
+    var jt = resolveJoinTimeSec(node);
+    var snap = getNodeStateAtTime(node.id, ts);
+    if (ts + 1e-9 < jt) {
+      return { kind: 'pending_join', label: '待入网', color: '#8a959c' };
+    }
+    if (!isGmcNode(node) && snap && (snap.join_state === 'pending_join' || snap.join_state === 'not_joined')) {
+      if (jt <= 0) {
+        return { kind: 'pending_join', label: '待入网', color: '#8a959c' };
+      }
     }
     var idx = state.offlineEventIndex || {};
     var offT = getMergedOfflineTime(node);
     var rj = idx.rejoinTime != null ? idx.rejoinTime[oid] : null;
-    if (offT != null && t + 1e-9 >= offT) {
-      if (rj != null && offT != null && rj > offT && t + 1e-9 >= rj) {
+    if (offT != null && ts + 1e-9 >= offT) {
+      if (rj != null && offT != null && rj > offT && ts + 1e-9 >= rj) {
         return { kind: 'joined', label: '已入网', color: '#43a047' };
       }
       return { kind: 'offline', label: '已退网', color: '#aaaaaa' };
@@ -266,22 +398,24 @@
 
   /** 详情面板：指标冻结在退网时刻之前（用于 [最后记录]） */
   function getMetricsReferenceTime(node, t) {
-    var st = getNodeNetworkStatus(node, t);
+    var ts = timelineSec(t);
+    var st = getNodeNetworkStatus(node, ts);
     var oid = Number(node.id);
-    if (st.kind !== 'offline') return t;
+    if (st.kind !== 'offline') return ts;
     var idx = state.offlineEventIndex || {};
     var boundary = idx.offlineTime != null ? idx.offlineTime[oid] : null;
     if (boundary == null) boundary = node.offlineTime;
-    if (boundary == null) return t;
-    return Math.min(t, boundary);
+    if (boundary == null) return ts;
+    return Math.min(ts, boundary);
   }
 
   /** 退网节点不绘制任何邻接链路 */
   function nodeShowsInTopologyLinks(n, t) {
     if (!n) return false;
-    var jt = n.joinTime != null ? n.joinTime : 0;
-    if (t < jt) return false;
-    var st = getNodeNetworkStatus(n, t);
+    var ts = timelineSec(t);
+    var jt = resolveJoinTimeSec(n);
+    if (ts + 1e-9 < jt) return false;
+    var st = getNodeNetworkStatus(n, ts);
     return st.kind !== 'offline';
   }
 
@@ -303,6 +437,7 @@
    * 各子网最近一次 SPN_ELECT 时间（仅统计「主 SPN」日志：elected as primary），且 e.t <= t
    */
   function getLatestPrimaryElectTimeBySubnet(t) {
+    var ts = timelineSec(t);
     var out = { '1': -1, '2': -1 };
     var evs = state.events || [];
     var nodes = state.topology.nodes || [];
@@ -314,7 +449,7 @@
     }
     for (var i = 0; i < evs.length; i++) {
       var e = evs[i];
-      if (e.t > t) continue;
+      if (e.t > ts) continue;
       if (e.event !== 'SPN_ELECT') continue;
       var d = e.details || '';
       if (!/elected as primary SPN/i.test(d)) continue;
@@ -348,35 +483,37 @@
 
   function shouldFadeInNodeOnPlay(n, t) {
     if (!state.playing) return false;
-    if (isInitialTimelineState(t)) return false;
-    var jt = n.joinTime != null ? n.joinTime : 0;
-    var prev = state.prevTimelineForAnim != null ? state.prevTimelineForAnim : 0;
+    var ts = timelineSec(t);
+    if (isInitialTimelineState(ts)) return false;
+    var jt = resolveJoinTimeSec(n);
+    var prev = timelineSec(state.prevTimelineForAnim != null ? state.prevTimelineForAnim : 0);
     if (isInitialTimelineState(prev)) {
-      return jt <= t + 1e-9;
+      return jt <= ts + 1e-9;
     }
-    return prev < jt && t + 1e-9 >= jt;
+    return prev < jt && ts + 1e-9 >= jt;
   }
 
   function shouldFadeInLinkForJoin(link, t, nodeById) {
     if (!state.playing) return false;
-    if (isInitialTimelineState(t)) return false;
+    var ts = timelineSec(t);
+    if (isInitialTimelineState(ts)) return false;
     var fromNode = nodeById[link.from], toNode = nodeById[link.to];
     if (!fromNode || !toNode) return false;
-    var jf = fromNode.joinTime != null ? fromNode.joinTime : 0;
-    var jto = toNode.joinTime != null ? toNode.joinTime : 0;
+    var jf = resolveJoinTimeSec(fromNode);
+    var jto = resolveJoinTimeSec(toNode);
     var jLink = Math.max(jf, jto);
-    var prev = state.prevTimelineForAnim != null ? state.prevTimelineForAnim : 0;
+    var prev = timelineSec(state.prevTimelineForAnim != null ? state.prevTimelineForAnim : 0);
     if (isInitialTimelineState(prev)) {
-      return jLink <= t + 1e-9;
+      return jLink <= ts + 1e-9;
     }
-    return prev < jLink && t + 1e-9 >= jLink;
+    return prev < jLink && ts + 1e-9 >= jLink;
   }
 
   function nodeVisible(node) {
     var f = getSubnetFilter();
     var s = (node.subnet || 'other').toLowerCase();
     var type = (node.type || '').toUpperCase();
-    var isGmc = s === 'gmc' || node.role === 'gmc';
+    var isGmc = s === 'gmc' || isGmcNode(node);
     var isLte = s === 'lte';
     var isAdhoc = s === 'adhoc';
     var isDatalink = s === 'datalink';
@@ -455,34 +592,35 @@
    * spnCache 可选，由 renderTopology 一次性传入。
    */
   function getNodeColorAtTime(node, t, spnCache) {
-    var joinTime = node.joinTime != null ? node.joinTime : 0;
-    if (t < joinTime) return COLORS.notJoined;
-    var netSt = getNodeNetworkStatus(node, t);
+    var ts = timelineSec(t);
+    var joinTime = resolveJoinTimeSec(node);
+    if (ts + 1e-9 < joinTime) return COLORS.notJoined;
+    var netSt = getNodeNetworkStatus(node, ts);
     if (netSt.kind === 'offline') return COLORS.offlineUnified;
-    if (node.role === 'gmc') return COLORS.gmc;
+    if (isGmcNode(node)) return COLORS.gmc;
     var sub = (node.subnet || '').toLowerCase();
     var typeUp = (node.type || '').toUpperCase();
     var nodes = state.topology.nodes || [];
     var sc = spnCache || {};
-    var lteP = sc.ltePrimary !== undefined ? sc.ltePrimary : getPrimarySpnIdForSubnetAtTime(t, 'lte', nodes);
-    var adhocP = sc.adhocPrimary !== undefined ? sc.adhocPrimary : getPrimarySpnIdForSubnetAtTime(t, 'adhoc', nodes);
-    var adhocC = sc.adhocCh !== undefined ? sc.adhocCh : getClusterHeadIdForSubnetAtTime(t, 'adhoc', nodes);
-    var dlP = sc.dlPrimary !== undefined ? sc.dlPrimary : getPrimarySpnIdForSubnetAtTime(t, 'datalink', nodes);
-    var dlC = sc.dlCh !== undefined ? sc.dlCh : getClusterHeadIdForSubnetAtTime(t, 'datalink', nodes);
+    var lteP = sc.ltePrimary !== undefined ? sc.ltePrimary : getPrimarySpnIdForSubnetAtTime(ts, 'lte', nodes);
+    var adhocP = sc.adhocPrimary !== undefined ? sc.adhocPrimary : getPrimarySpnIdForSubnetAtTime(ts, 'adhoc', nodes);
+    var adhocC = sc.adhocCh !== undefined ? sc.adhocCh : getClusterHeadIdForSubnetAtTime(ts, 'adhoc', nodes);
+    var dlP = sc.dlPrimary !== undefined ? sc.dlPrimary : getPrimarySpnIdForSubnetAtTime(ts, 'datalink', nodes);
+    var dlC = sc.dlCh !== undefined ? sc.dlCh : getClusterHeadIdForSubnetAtTime(ts, 'datalink', nodes);
     var id = Number(node.id);
     if (sub === 'lte') {
       if (lteP != null && id === lteP) return COLORS.spn;
-      return COLORS.subnetTsn;
+      return COLORS.lte;
     }
     /** 首次 SPN_ANNOUNCE 前：自组网/数据链统一为 TSN 浅蓝（选举完成后再显示 Primary/簇首等） */
     if (sub === 'adhoc') {
-      if (isPreSpnAnnounceSubnetStyle(t, 'adhoc')) return COLORS.subnetTsn;
+      if (isPreSpnAnnounceSubnetStyle(ts, 'adhoc')) return COLORS.subnetTsn;
       if (adhocP != null && id === adhocP) return COLORS.spn;
-      if (adhocC != null && id === adhocC) return COLORS.clusterHead;
+      if (adhocC != null && id === adhocC) return COLORS.adhoc;
       return COLORS.adhoc;
     }
     if (sub === 'datalink') {
-      if (isPreSpnAnnounceSubnetStyle(t, 'datalink')) return COLORS.subnetTsn;
+      if (isPreSpnAnnounceSubnetStyle(ts, 'datalink')) return COLORS.subnetTsn;
       if (dlP != null && id === dlP) return COLORS.spn;
       if (dlC != null && id === dlC) return COLORS.clusterHead;
       return COLORS.datalink;
@@ -502,10 +640,10 @@
       '<span><span class="dot" style="background:' + COLORS.datalink + '"></span> 数据链普通</span>' +
       '<span><span class="dot" style="background:' + COLORS.subnetTsn + '"></span> TSN 节点</span>' +
       '<span><span class="dot" style="background:' + COLORS.spn + '"></span> Primary SPN</span>' +
-      '<span><span class="dot" style="background:' + COLORS.clusterHead + '"></span> 簇首</span>' +
+      '<span style="display:inline-flex;align-items:center;vertical-align:middle"><svg width="20" height="20" style="vertical-align:middle;margin-right:4px"><circle cx="10" cy="10" r="7" fill="none" stroke="' + COLORS.chHaloGold + '" stroke-width="2.5"/></svg> 簇首 [CH]（金色光环）</span>' +
       '<span style="display:inline-flex;align-items:center;vertical-align:middle"><svg width="18" height="18" style="vertical-align:middle;margin-right:4px"><circle cx="9" cy="9" r="6" fill="' + COLORS.spn + '"/><circle cx="9" cy="9" r="8" fill="none" stroke="#ff9944" stroke-width="1.5"/></svg> 橙色双圈 = Primary SPN</span>' +
-      '<span style="display:inline-flex;align-items:center;vertical-align:middle"><svg width="22" height="22" style="vertical-align:middle;margin-right:4px"><circle cx="11" cy="11" r="10" fill="none" stroke="' + COLORS.clusterHead + '" stroke-width="1.5"/><circle cx="11" cy="11" r="7" fill="' + COLORS.spn + '"/><circle cx="11" cy="11" r="9" fill="none" stroke="#ff9944" stroke-width="1.2"/></svg> 橙双圈+绿边 = SPN 兼簇首</span>' +
-      '<span><span class="dot" style="background:' + COLORS.notJoined + '"></span> 未入网</span>' +
+      '<span style="display:inline-flex;align-items:center;vertical-align:middle"><svg width="22" height="22" style="vertical-align:middle;margin-right:4px"><circle cx="11" cy="11" r="10" fill="none" stroke="' + COLORS.chHaloGold + '" stroke-width="2"/><circle cx="11" cy="11" r="7" fill="' + COLORS.spn + '"/><circle cx="11" cy="11" r="9" fill="none" stroke="#ff9944" stroke-width="1.2"/></svg> 金环+橙圈 = Primary SPN + [CH]</span>' +
+      '<span><span class="dot" style="background:' + COLORS.notJoined + '"></span> 待入网（t &lt; join_time）</span>' +
       '<span><span class="dot" style="background:' + COLORS.offlineUnified + ';opacity:0.5"></span> 已退网</span>' +
       '<span><span class="line" style="background:' + COLORS.spn + ';height:3px"></span> 橙色实线 = Primary SPN 链路</span>' +
       '<span><span class="line" style="background:transparent;height:0;border-top:3px dashed ' + COLORS.spn + '"></span> 橙色虚线 = Backup SPN 链路</span>' +
@@ -530,9 +668,10 @@
 
   function nodeEligibleForLinkAtTime(n, t) {
     if (!n) return false;
-    var jt = n.joinTime != null ? n.joinTime : 0;
-    if (t < jt) return false;
-    return nodeShowsInTopologyLinks(n, t);
+    var ts = timelineSec(t);
+    var jt = resolveJoinTimeSec(n);
+    if (ts + 1e-9 < jt) return false;
+    return nodeShowsInTopologyLinks(n, ts);
   }
 
   /**
@@ -584,7 +723,7 @@
     rebuildOfflineEventIndex();
     var nodes = state.topology.nodes || [];
     var links = state.topology.links || [];
-    var t = state.currentTime;
+    var t = timelineSec(state.currentTime);
     var initialOnly = isInitialTimelineState(t);
     var w = topologyEl.clientWidth || 600;
     var h = topologyEl.clientHeight || 320;
@@ -647,6 +786,7 @@
     }
 
     var useSpnAnnounceLinks = (state.events || []).some(function (e) { return e.event === 'SPN_ANNOUNCE'; });
+    var adhocChIdForLinks = getClusterHeadIdForSubnetAtTime(t, 'adhoc', nodes);
     var seenLinks = {};
     for (var j = 0; j < links.length; j++) {
       var link = links[j];
@@ -655,8 +795,8 @@
       var fromNode = nodeById[link.from], toNode = nodeById[link.to];
       if (!fromNode || !toNode || !nodeVisible(fromNode) || !nodeVisible(toNode)) continue;
       if (!nodeShowsInTopologyLinks(fromNode, t) || !nodeShowsInTopologyLinks(toNode, t)) continue;
-      var joinFrom = fromNode.joinTime != null ? fromNode.joinTime : 0, joinTo = toNode.joinTime != null ? toNode.joinTime : 0;
-      if (t < joinFrom || t < joinTo) continue;
+      var joinFrom = resolveJoinTimeSec(fromNode), joinTo = resolveJoinTimeSec(toNode);
+      if (t + 1e-9 < joinFrom || t + 1e-9 < joinTo) continue;
       var linkKey = link.from < link.to ? link.from + ',' + link.to : link.to + ',' + link.from;
       if (seenLinks[linkKey]) continue;
       seenLinks[linkKey] = true;
@@ -666,6 +806,14 @@
       var stroke = isBackhaul ? '#c03030' : '#4080c0';
       var strokeWidth = isBackhaul ? 3 : 1.5;
       if (link.linkQuality != null && link.linkQuality > 0) strokeWidth = Math.max(1, Math.min(4, 1 + link.linkQuality * 3));
+      if (!isBackhaul && adhocChIdForLinks != null) {
+        var subA = (fromNode.subnet || '').toLowerCase() === 'adhoc';
+        var subB = (toNode.subnet || '').toLowerCase() === 'adhoc';
+        if (subA && subB) {
+          var fId = Number(fromNode.id), tId = Number(toNode.id), ch = Number(adhocChIdForLinks);
+          if ((fId === ch && tId !== ch) || (tId === ch && fId !== ch)) strokeWidth *= 1.5;
+        }
+      }
       var dash = isBackhaul ? '' : 'stroke-dasharray:6,4';
       var linkFade = shouldFadeInLinkForJoin(link, t, nodeById) ? '<animate attributeName="opacity" from="0" to="1" dur="0.3s" fill="freeze" />' : '';
       svg += '<line x1="' + x1 + '" y1="' + y1 + '" x2="' + x2 + '" y2="' + y2 + '" stroke="' + stroke + '" stroke-width="' + strokeWidth + '" style="' + dash + '">' + linkFade + '</line>';
@@ -687,7 +835,7 @@
 
     for (var k = 0; k < nodes.length; k++) {
       var n = nodes[k];
-      var joinTime = n.joinTime != null ? n.joinTime : 0;
+      var joinTime = resolveJoinTimeSec(n);
       if (!nodeVisible(n)) continue;
       var p = posAtT[n.id];
       if (!p) continue;
@@ -710,7 +858,8 @@
       var isBackupDl = isDlNode && !preDl && spnCache.dlBackup != null && nid === spnCache.dlBackup && nid !== spnCache.dlPrimary;
       var netSt = getNodeNetworkStatus(n, t);
       var fadeAnim = shouldFadeInNodeOnPlay(n, t) ? '<animate attributeName="opacity" from="0" to="1" dur="0.3s" fill="freeze" />' : '';
-      var r = n.role === 'gmc' ? 12 : 8;
+      var rBase = isGmcNode(n) ? 12 : 8;
+      var r = (isAdhocNode && isChAdhoc && !preAd) ? rBase * 1.3 : rBase;
 
       if (netSt.kind === 'offline') {
         var labelOff = (n.label || ('N' + n.id)) + ' (退网)';
@@ -727,8 +876,8 @@
         continue;
       }
 
-      if (netSt.kind === 'not_joined') {
-        var labelNj = (n.label || ('N' + n.id)) + ' (未入网)';
+      if (netSt.kind === 'pending_join' || netSt.kind === 'not_joined') {
+        var labelNj = (n.label || ('N' + n.id)) + ' (待入网)';
         var titleNj = labelNj;
         svg += '<circle cx="' + cx + '" cy="' + cy + '" r="' + r + '" fill="' + COLORS.notJoined + '" fill-opacity="0.35" stroke="#5a6a80" stroke-width="1.5" stroke-dasharray="4,3" filter="url(#nodeShadow)" data-node-id="' + n.id + '" class="node-circle node-not-joined">' + fadeAnim + '</circle>';
         var regionNj = getSubnetRegion(n);
@@ -742,9 +891,9 @@
         continue;
       }
 
-      var strokeColor = n.role === 'gmc' ? '#ff4444'
+      var strokeColor = isGmcNode(n) ? '#ff4444'
         : (isPriAdhoc || isPriDl || isPriLte ? '#ff9944' : (isTsnNode ? '#4a8aaa' : (isLteNode ? '#4a8aaa' : '#444')));
-      var strokeW = n.role === 'gmc' ? 2.5 : 1.5;
+      var strokeW = isGmcNode(n) ? 2.5 : 1.5;
       var ringOrange = '#ff9944';
 
       if (isAdhocNode && !initialOnly && isInSpnElectAnimationWindow(t, 'adhoc')) {
@@ -762,14 +911,20 @@
 
       var drawSpnChRings = function (isPri, isCh, isBackup) {
         if (isBackup) {
+          if (isCh) {
+            svg += '<circle cx="' + cx + '" cy="' + cy + '" r="' + (r + 6) + '" fill="none" stroke="' + COLORS.chHaloGold + '" stroke-width="3" opacity="0.95" class="ch-halo"/>';
+          }
           svg += '<circle cx="' + cx + '" cy="' + cy + '" r="' + r + '" fill="' + color + '" stroke="' + ringOrange + '" stroke-width="2.5" stroke-dasharray="6,5" filter="url(#nodeShadow)" data-node-id="' + n.id + '" class="node-circle">' + fadeAnim + '</circle>';
         } else if (isPri && isCh) {
-          svg += '<circle cx="' + cx + '" cy="' + cy + '" r="' + (r + 4) + '" fill="none" stroke="' + COLORS.clusterHead + '" stroke-width="2"/>';
-          svg += '<circle cx="' + cx + '" cy="' + cy + '" r="' + (r + 2) + '" fill="none" stroke="' + ringOrange + '" stroke-width="2"/>';
+          svg += '<circle cx="' + cx + '" cy="' + cy + '" r="' + (r + 6) + '" fill="none" stroke="' + COLORS.chHaloGold + '" stroke-width="3" opacity="0.95" class="ch-halo"/>';
+          svg += '<circle cx="' + cx + '" cy="' + cy + '" r="' + (r + 3) + '" fill="none" stroke="' + ringOrange + '" stroke-width="2.5"/>';
           svg += '<circle cx="' + cx + '" cy="' + cy + '" r="' + r + '" fill="' + color + '" stroke="' + ringOrange + '" stroke-width="' + strokeW + '" filter="url(#nodeShadow)" data-node-id="' + n.id + '" class="node-circle">' + fadeAnim + '</circle>';
         } else if (isPri) {
           svg += '<circle cx="' + cx + '" cy="' + cy + '" r="' + (r + 2) + '" fill="none" stroke="' + ringOrange + '" stroke-width="3"/>';
           svg += '<circle cx="' + cx + '" cy="' + cy + '" r="' + r + '" fill="' + color + '" stroke="' + ringOrange + '" stroke-width="2.5" filter="url(#nodeShadow)" data-node-id="' + n.id + '" class="node-circle">' + fadeAnim + '</circle>';
+        } else if (isCh) {
+          svg += '<circle cx="' + cx + '" cy="' + cy + '" r="' + (r + 6) + '" fill="none" stroke="' + COLORS.chHaloGold + '" stroke-width="3" opacity="0.95" class="ch-halo"/>';
+          svg += '<circle cx="' + cx + '" cy="' + cy + '" r="' + r + '" fill="' + color + '" stroke="' + strokeColor + '" stroke-width="' + strokeW + '" filter="url(#nodeShadow)" data-node-id="' + n.id + '" class="node-circle">' + fadeAnim + '</circle>';
         } else {
           svg += '<circle cx="' + cx + '" cy="' + cy + '" r="' + r + '" fill="' + color + '" stroke="' + strokeColor + '" stroke-width="' + strokeW + '" filter="url(#nodeShadow)" data-node-id="' + n.id + '" class="node-circle">' + fadeAnim + '</circle>';
         }
@@ -798,20 +953,21 @@
       }
 
       var label = n.label || ('N' + n.id);
+      if (isChAdhoc && !preAd) label += ' [CH]';
       var tag = '';
       if (isAdhocNode) {
         if (preAd) tag = 'TSN Node';
-        else if (isPriAdhoc && isChAdhoc) tag = 'SPN+簇首';
+        else if (isPriAdhoc && isChAdhoc) tag = 'Primary SPN + [CH]';
         else if (isPriAdhoc) tag = 'Primary SPN';
         else if (isBackupAdhoc) tag = 'Backup SPN';
-        else if (isChAdhoc) tag = '簇首';
+        else if (isChAdhoc) tag = '[CH]';
       } else if (isDlNode) {
         if (preDl) tag = 'TSN Node';
         else if (isPriDl) tag = 'Primary SPN';
         else if (isBackupDl) tag = 'Backup SPN';
       } else if (isLteNode) {
         if (isPriLte) tag = 'Primary SPN';
-        else tag = 'TSN';
+        else tag = 'TSN Node';
       } else {
         var roleNow = ((getNodeStateAtTime(n.id, t) || {}).role || n.role || '').toLowerCase();
         tag = ((roleNow === 'spn' || roleNow === 'primary_spn') ? 'Primary SPN'
@@ -838,11 +994,12 @@
 
   function getNodeStateAtTime(nodeId, t) {
     if (!state.nodeStatesAtTime || typeof state.nodeStatesAtTime !== 'object') return null;
+    var ts = timelineSec(t);
     var keys = Object.keys(state.nodeStatesAtTime).map(parseFloat).sort(function (a, b) { return a - b; });
     if (!keys.length) return null;
     var best = keys[0];
     for (var i = 0; i < keys.length; i++) {
-      if (keys[i] <= t) best = keys[i];
+      if (keys[i] <= ts) best = keys[i];
       else break;
     }
     var states = state.nodeStatesAtTime[String(best)];
@@ -859,13 +1016,38 @@
     return null;
   }
 
+  /** 当前时刻之前（含）最新 CH_ANNOUNCE 的 Adhoc 簇首（subnet=1，与 C++ 日志一致） */
+  function getAdhocClusterHeadFromEvents(t) {
+    var ts = timelineSec(t);
+    var evs = state.events || [];
+    var best = null;
+    var bestT = -1;
+    for (var i = 0; i < evs.length; i++) {
+      var e = evs[i];
+      if (e.t > ts) continue;
+      if (e.event !== 'CH_ANNOUNCE') continue;
+      var d = e.details || '';
+      var ms = d.match(/subnet\s*=\s*(\d+)/i);
+      if (ms && ms[1] !== '1') continue;
+      var mc = d.match(/cluster_head\s*=\s*(\d+)/i);
+      if (!mc) continue;
+      var ch = parseInt(mc[1], 10);
+      if (e.t >= bestT) {
+        bestT = e.t;
+        best = ch;
+      }
+    }
+    return best;
+  }
+
   /** 当前时刻 t 之前（含）各子网最新 SPN_ANNOUNCE 的 primary/backup（按 subnet 数字键） */
   function getSubnetAnnounceMapAtTime(t) {
+    var ts = timelineSec(t);
     var best = {};
     var evs = state.events || [];
     for (var i = 0; i < evs.length; i++) {
       var e = evs[i];
-      if (e.t > t) continue;
+      if (e.t > ts) continue;
       if (e.event !== 'SPN_ANNOUNCE') continue;
       var d = e.details || '';
       var ms = d.match(/subnet=(\d+)/i);
@@ -901,8 +1083,9 @@
    * 蜂窝：subnet=0；自组网=1；数据链=2。LTE 无事件时用 getLtePrimaryFallbackFromTopology。
    */
   function getPrimarySpnIdForSubnetAtTime(t, subnetStr, topologyNodes) {
+    var ts = timelineSec(t);
     var key = subnetStringToAnnounceKey(subnetStr);
-    var ann = getSubnetAnnounceMapAtTime(t);
+    var ann = getSubnetAnnounceMapAtTime(ts);
     if (key != null && ann[key] && ann[key].primary != null) return ann[key].primary;
     var list = topologyNodes || [];
     var last = null;
@@ -911,7 +1094,7 @@
     var subLower = subnetStr.toLowerCase();
     for (var i = 0; i < evs.length; i++) {
       var e = evs[i];
-      if (e.t > t) continue;
+      if (e.t > ts) continue;
       if (e.event !== 'SPN_ELECT') continue;
       var d = e.details || '';
       var pid = null;
@@ -957,8 +1140,9 @@
 
   /** 各子网 Backup SPN：SPN_ANNOUNCE 优先；否则解析 SPN_ELECT 多行「Backup:  Node X」 */
   function getBackupSpnIdForSubnetAtTime(t, subnetStr, topologyNodes) {
+    var ts = timelineSec(t);
     var key = subnetStringToAnnounceKey(subnetStr);
-    var ann = getSubnetAnnounceMapAtTime(t);
+    var ann = getSubnetAnnounceMapAtTime(ts);
     if (key != null && ann[key] && ann[key].backup != null && ann[key].primary != null && ann[key].backup !== ann[key].primary) {
       return ann[key].backup;
     }
@@ -969,7 +1153,7 @@
     var evs = state.events || [];
     for (var i = 0; i < evs.length; i++) {
       var e = evs[i];
-      if (e.t > t) continue;
+      if (e.t > ts) continue;
       if (e.event !== 'SPN_ELECT') continue;
       var d = e.details || '';
       var subOk = (subLower === 'adhoc' && /SubNet:\s*Adhoc/i.test(d)) || (subLower === 'datalink' && /SubNet:\s*DataLink/i.test(d));
@@ -998,11 +1182,12 @@
 
   /** NEIGHBOR_DISCOVER：被发现的邻居 nodeId → 被多少节点发现（入度） */
   function getNeighborDiscoverInDegreeAtTime(t) {
+    var ts = timelineSec(t);
     var counts = {};
     var evs = state.events || [];
     for (var i = 0; i < evs.length; i++) {
       var e = evs[i];
-      if (e.t > t) continue;
+      if (e.t > ts) continue;
       if (e.event !== 'NEIGHBOR_DISCOVER') continue;
       var d = e.details || '';
       var m = d.match(/neighbor\s+nodeId\s*=\s*(\d+)/i);
@@ -1020,6 +1205,10 @@
    */
   function getClusterHeadIdForSubnetAtTime(t, subnetStr, topologyNodes) {
     if ((subnetStr || '').toLowerCase() === 'datalink') return null;
+    if ((subnetStr || '').toLowerCase() === 'adhoc') {
+      var chEv = getAdhocClusterHeadFromEvents(t);
+      if (chEv != null) return chEv;
+    }
     var counts = getNeighborDiscoverInDegreeAtTime(t);
     var subLower = subnetStr.toLowerCase();
     var inSubnet = {};
@@ -1062,21 +1251,22 @@
    * 主/备由最新 SPN_ANNOUNCE；TSN 为普通节点，仅子网归属不同。
    */
   function getNodeRoleLabelFromEvents(node, t) {
+    var ts = timelineSec(t);
     var nid = Number(node.id);
     var sub = (node.subnet || '').toLowerCase();
     if (nid === 0 || sub === 'gmc' || String(node.role || '').toLowerCase() === 'gmc') return 'GMC';
-    var ns = getNodeNetworkStatus(node, t);
+    var ns = getNodeNetworkStatus(node, ts);
     if (ns.kind === 'offline') return '—';
-    if (ns.kind === 'not_joined') return '未入网';
+    if (ns.kind === 'pending_join' || ns.kind === 'not_joined') return '待入网';
     var rTop = String(resolveTopologyRoleFallback(node) || '').toLowerCase();
     if (rTop === 'primary_spn') return 'Primary SPN';
     if (rTop === 'backup_spn') return sub === 'lte' ? 'TSN' : 'Backup SPN';
     if (rTop === 'ue' && sub === 'lte') return 'TSN';
     if (rTop === 'ue') return 'UE';
     if (rTop === 'tsn' && (sub === 'adhoc' || sub === 'datalink')) return 'TSN 节点';
-    if (sub === 'adhoc' && isPreSpnAnnounceSubnetStyle(t, 'adhoc')) return 'TSN Node';
-    if (sub === 'datalink' && isPreSpnAnnounceSubnetStyle(t, 'datalink')) return 'TSN Node';
-    var ann = getSubnetAnnounceMapAtTime(t);
+    if (sub === 'adhoc' && isPreSpnAnnounceSubnetStyle(ts, 'adhoc')) return 'TSN Node';
+    if (sub === 'datalink' && isPreSpnAnnounceSubnetStyle(ts, 'datalink')) return 'TSN Node';
+    var ann = getSubnetAnnounceMapAtTime(ts);
     var key = subnetStringToAnnounceKey(sub);
     if (key != null && ann[key]) {
       var a = ann[key];
@@ -1085,16 +1275,16 @@
     }
     var nodesList = state.topology.nodes || [];
     if (sub === 'adhoc' || sub === 'datalink') {
-      var priR = getPrimarySpnIdForSubnetAtTime(t, sub, nodesList);
-      var bakR = getBackupSpnIdForSubnetAtTime(t, sub, nodesList);
+      var priR = getPrimarySpnIdForSubnetAtTime(ts, sub, nodesList);
+      var bakR = getBackupSpnIdForSubnetAtTime(ts, sub, nodesList);
       if (priR != null && Number(nid) === Number(priR)) return 'Primary SPN';
       if (bakR != null && Number(nid) === Number(bakR)) return 'Backup SPN';
     }
     if (sub === 'lte') {
       var nodesL = state.topology.nodes || [];
-      var ltePri = getPrimarySpnIdForSubnetAtTime(t, 'lte', nodesL);
+      var ltePri = getPrimarySpnIdForSubnetAtTime(ts, 'lte', nodesL);
       if (ltePri != null && Number(nid) === Number(ltePri)) return 'Primary SPN';
-      return 'TSN';
+      return 'TSN Node';
     }
     if (sub === 'tsn' || String(node.type || '').toUpperCase() === 'TSN') return '普通节点';
     return '—';
@@ -1156,7 +1346,7 @@
     var oid = Number(node.id);
     var tOff = getMergedOfflineTime(node);
     if (tOff == null) return '';
-    var reason = (idx.offlineReasonText && idx.offlineReasonText[oid]) ? idx.offlineReasonText[oid] : '见仿真日志 NODE_OFFLINE（fault/voluntary 内部区分）';
+    var reason = (idx.offlineReasonText && idx.offlineReasonText[oid]) ? idx.offlineReasonText[oid] : '见仿真日志 NODE_OFFLINE 详情';
     return '<div class="row"><span class="label">退网时间</span>' + tOff.toFixed(2) + ' s</div>' +
       '<div class="row"><span class="label">退网原因</span>' + reason + '</div>';
   }
@@ -1164,8 +1354,8 @@
   function showNodeDetail(node) {
     rebuildOfflineEventIndex();
     state.nodeDetailNodeId = node.id;
-    var t = state.currentTime;
-    var joinTime = node.joinTime != null ? node.joinTime : 0;
+    var t = timelineSec(state.currentTime);
+    var joinTime = resolveJoinTimeSec(node);
     var netStatus = getNodeNetworkStatus(node, t);
     var tMet = getMetricsReferenceTime(node, t);
     var stateAt = getNodeStateAtTime(node.id, tMet);
@@ -1229,7 +1419,7 @@
   }
 
   function updateEventList() {
-    var t = state.currentTime;
+    var t = timelineSec(state.currentTime);
     if (isInitialTimelineState(t)) {
       eventListEl.innerHTML = '<div class="event-placeholder" style="color:#888;font-size:0.75rem;padding:8px;">等待仿真开始（将时间轴拖离 0s 后显示事件）</div>';
       eventListEl.scrollTop = 0;
@@ -1258,8 +1448,9 @@
     var maxT = getTimelineMaxT();
     updateTimelineChrome();
     state.prevTimelineForAnim = state.currentTime;
-    state.currentTime = Math.max(0, Math.min(maxT, tt));
-    timelineEl.value = state.currentTime;
+    var next = timelineSec(Math.max(0, Math.min(maxT, Number(tt))));
+    state.currentTime = next;
+    timelineEl.value = String(next);
     timeLabelEl.textContent = state.currentTime.toFixed(2) + ' s';
     updateEventList();
     renderTopology();
@@ -1273,7 +1464,7 @@
     if (state.playing) return;
     state.playing = true;
     var maxT = getTimelineMaxT();
-    var start = state.currentTime;
+    var start = timelineSec(state.currentTime);
     var startReal = Date.now();
     function tick() {
       if (!state.playing) return;
@@ -1655,19 +1846,7 @@
           state.businessFlows.forEach(function(f) { state.selectedFlowIds[f.id] = true; });
         }
       });
-      setTime(0);
-      renderTopology();
-      updateEventList();
-      updateCharts();
-      updateBusinessFlowList();
-      if (chartBusinessEl && chartBusinessEl.classList.contains('active')) {
-        requestAnimationFrame(function () {
-          updateCharts();
-          if (chartBusinessRadarEl) { var ch = echarts.getInstanceByDom(chartBusinessRadarEl); if (ch) ch.resize(); }
-          if (chartBusinessLinkQEl) { var lq = echarts.getInstanceByDom(chartBusinessLinkQEl); if (lq) lq.resize(); }
-        });
-      }
-      if (nodeDetailContent) { nodeDetailContent.innerHTML = '<span class="empty">点击拓扑中的节点查看详情</span>'; nodeDetailContent.classList.add('empty'); }
+      refreshAfterVisualizationLoad();
     }).catch(function (err) { alert('加载失败: ' + err.message); });
   }
 
@@ -1685,49 +1864,7 @@
       // 2) 在仓库根目录起服务 -> visualization/data
       candidates = ['data', 'visualization/data'];
     }
-    var tryLoad = function (idx) {
-      if (idx >= candidates.length) {
-        alert('加载失败：请确认已执行导出命令并检查路径。\n建议命令：python3 export_visualization_data.py simulation_results/时间戳 -o visualization/data');
-        return;
-      }
-      var base = candidates[idx];
-      Promise.all([
-        fetch(base + '/topology.json').then(function (r) { return r.ok ? r.json() : null; }),
-        fetch(base + '/events.json').then(function (r) { return r.ok ? r.json() : null; }),
-        fetch(base + '/stats.json').then(function (r) { return r.ok ? r.json() : null; })
-      ]).then(function (arr) {
-        if (!arr[0] || !arr[1] || !arr[2]) {
-          tryLoad(idx + 1);
-          return;
-        }
-        document.getElementById('resultPath').value = base;
-      if (arr[0]) {
-        state.topology = arr[0];
-        state._topologySnapshotDone = false;
-        state.initialTopologyById = null;
-      }
-      if (arr[1]) state.events = arr[1];
-      if (arr[2]) {
-        state.stats = arr[2];
-        state.nodeStatesAtTime = (arr[2] && arr[2].nodeStatesByTime) ? arr[2].nodeStatesByTime : null;
-        state.businessFlows = (arr[2] && arr[2].businessFlows) ? arr[2].businessFlows : [];
-        state.businessFeatures = (arr[2] && arr[2].businessFeatures) ? arr[2].businessFeatures : [];
-        state.flowPerformance = (arr[2] && arr[2].flowPerformance) ? arr[2].flowPerformance : [];
-        state.networkRadarMetrics = (arr[2] && arr[2].networkRadarMetrics) ? arr[2].networkRadarMetrics : {};
-        state.networkRadarCosts = (arr[2] && arr[2].networkRadarCosts) ? arr[2].networkRadarCosts : {};
-        state.stateDrivenKpi = (arr[2] && arr[2].stateDrivenKpi) ? arr[2].stateDrivenKpi : {};
-        state.selectedFlowIds = {};
-        state.businessFlows.forEach(function(f) { state.selectedFlowIds[f.id] = true; });
-      }
-      setTime(0);
-      renderTopology();
-      updateEventList();
-      updateCharts();
-      updateBusinessFlowList();
-      if (nodeDetailContent) { nodeDetailContent.innerHTML = '<span class="empty">点击拓扑中的节点查看详情</span>'; nodeDetailContent.classList.add('empty'); }
-      }).catch(function () { tryLoad(idx + 1); });
-    };
-    tryLoad(0);
+    tryLoadVisualizationHttp(candidates, 0, { silent: false });
   });
   document.getElementById('btnExportCsv').addEventListener('click', function () {
     if (!state.events.length) { alert('无事件数据'); return; }

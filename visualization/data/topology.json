@@ -10,6 +10,7 @@
       "joinTime": 0.0,
       "speed": 0.0,
       "ip": "10.100.0.1",
+      "joinState": "joined",
       "energy": 1.0,
       "link_quality": 0.95
     },
@@ -23,8 +24,9 @@
       "joinTime": 0.0,
       "speed": 0.0,
       "ip": "10.1.0.1",
-      "energy": 0.4,
-      "link_quality": 0.565
+      "joinState": "joined",
+      "energy": 0.35,
+      "link_quality": 0.641
     },
     {
       "id": 2,
@@ -36,8 +38,9 @@
       "joinTime": 0.0,
       "speed": 0.0,
       "ip": "10.1.0.2",
-      "energy": 0.4,
-      "link_quality": 0.897
+      "joinState": "joined",
+      "energy": 0.35,
+      "link_quality": 0.929
     },
     {
       "id": 3,
@@ -50,6 +53,7 @@
       "speed": 0.0,
       "offlineTime": 75.0,
       "ip": "10.1.0.3",
+      "joinState": "offline",
       "energy": 0.95,
       "link_quality": 0.95
     },
@@ -64,6 +68,7 @@
       "speed": 0.0,
       "offlineTime": 60.0,
       "ip": "10.1.0.4",
+      "joinState": "offline",
       "energy": 0.85,
       "link_quality": 0.9
     },
@@ -77,12 +82,13 @@
       "joinTime": 0.0,
       "speed": 0.0,
       "ip": "10.1.0.5",
-      "energy": 0.4,
-      "link_quality": 0.811
+      "joinState": "joined",
+      "energy": 0.35,
+      "link_quality": 0.95
     },
     {
       "id": 6,
-      "label": "SPN-6",
+      "label": "Node-6",
       "role": "TSN",
       "subnet": "datalink",
       "x": 220.0,
@@ -90,8 +96,9 @@
       "joinTime": 0.0,
       "speed": 15.0,
       "ip": "10.2.0.1",
-      "energy": 0.4,
-      "link_quality": 0.928
+      "joinState": "joined",
+      "energy": 0.35,
+      "link_quality": 0.857
     },
     {
       "id": 7,
@@ -103,12 +110,13 @@
       "joinTime": 0.0,
       "speed": 16.0,
       "ip": "10.2.0.2",
-      "energy": 0.4,
-      "link_quality": 0.968
+      "joinState": "joined",
+      "energy": 0.35,
+      "link_quality": 0.963
     },
     {
       "id": 8,
-      "label": "Node-8",
+      "label": "SPN-8",
       "role": "PRIMARY_SPN",
       "subnet": "datalink",
       "x": 270.0,
@@ -116,8 +124,9 @@
       "joinTime": 0.0,
       "speed": 17.0,
       "ip": "10.2.0.3",
-      "energy": 0.4,
-      "link_quality": 0.922
+      "joinState": "joined",
+      "energy": 0.35,
+      "link_quality": 0.953
     },
     {
       "id": 9,
@@ -129,8 +138,9 @@
       "joinTime": 0.0,
       "speed": 18.0,
       "ip": "10.2.0.4",
-      "energy": 0.4,
-      "link_quality": 0.916
+      "joinState": "joined",
+      "energy": 0.35,
+      "link_quality": 1.0
     },
     {
       "id": 10,
@@ -142,21 +152,23 @@
       "joinTime": 0.0,
       "speed": 0.0,
       "ip": "10.0.0.5",
-      "energy": 0.996,
-      "link_quality": 0.99
+      "joinState": "joined",
+      "energy": 0.995,
+      "link_quality": 1.0
     },
     {
       "id": 11,
       "label": "Node-11",
-      "role": "BACKUP_SPN",
+      "role": "TSN",
       "subnet": "lte",
       "x": 10.0,
       "y": 10.0,
       "joinTime": 0.0,
       "speed": 0.0,
       "ip": "7.0.0.2",
-      "energy": 0.876,
-      "link_quality": 0.923
+      "joinState": "joined",
+      "energy": 0.875,
+      "link_quality": 0.927
     },
     {
       "id": 12,
@@ -168,8 +180,9 @@
       "joinTime": 10.0,
       "speed": 0.0,
       "ip": "7.0.0.3",
+      "joinState": "joined",
       "energy": 0.946,
-      "link_quality": 1.0
+      "link_quality": 0.988
     },
     {
       "id": 13,
@@ -181,8 +194,9 @@
       "joinTime": 12.0,
       "speed": 0.0,
       "ip": "7.0.0.4",
+      "joinState": "joined",
       "energy": 0.876,
-      "link_quality": 0.884
+      "link_quality": 0.868
     },
     {
       "id": 14,
@@ -194,8 +208,9 @@
       "joinTime": 14.0,
       "speed": 0.0,
       "ip": "7.0.0.5",
+      "joinState": "joined",
       "energy": 0.876,
-      "link_quality": 0.898
+      "link_quality": 0.901
     },
     {
       "id": 15,
@@ -207,8 +222,9 @@
       "joinTime": 16.0,
       "speed": 0.0,
       "ip": "7.0.0.6",
+      "joinState": "joined",
       "energy": 0.876,
-      "link_quality": 0.858
+      "link_quality": 0.841
     }
   ],
   "links": [
@@ -304,7 +320,7 @@
     },
     {
       "from": 0,
-      "to": 6,
+      "to": 8,
       "type": "backhaul",
       "t": 0.0
     }

@@ -95,13 +95,13 @@
       "time": 60.0,
       "type": "NODE_OFFLINE",
       "target": 4,
-      "reason": "fault"
+      "reason": "power_low"
     },
     {
       "time": 75.0,
       "type": "NODE_OFFLINE",
       "target": 3,
-      "reason": "fault"
+      "reason": "link_loss"
     }
   ]
 }

@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-从仿真结果目录导出可视化平台所需数据：topology.json、events.json。
+从仿真结果目录导出可视化平台所需数据：topology.json（含 adhocCluster 簇首历史）、events.json。
 可选用 NetAnim XML 或 log 解析拓扑与事件；flowmon 统计由前端或 plot-flowmon 使用。
 
 用法:
@@ -146,14 +146,14 @@ def role_is_spn_for_backhaul(r):
 
 
 def get_join_time_by_node(events):
-    """从 NODE_ONLINE 与 SYSTEM 得到每个节点的入网时间。"""
+    """从 NODE_ONLINE / NODE_UP 与 SYSTEM 得到每个节点的入网时间（与仿真日志一致）。"""
     join_time = {}
     for ev in events:
         n = ev["nodeId"]
         t = ev["t"]
         if ev["event"] == "SYSTEM" and n == 0:
             join_time[0] = min(join_time.get(0, t), t)
-        if ev["event"] == "NODE_ONLINE":
+        if ev["event"] in ("NODE_ONLINE", "NODE_UP"):
             join_time[n] = min(join_time.get(n, t), t)
     return join_time
 
@@ -168,6 +168,33 @@ def get_offline_time_by_node(events):
         t = ev["t"]
         offline_time[n] = max(offline_time.get(n, t), t)
     return offline_time
+
+
+def extract_adhoc_ch_elect_history(events):
+    """从 CH_ANNOUNCE 解析 Adhoc 簇首选举历史（subnet=1，与仿真 C++ 日志一致）。"""
+    hist = []
+    for ev in events or []:
+        if ev.get("event") != "CH_ANNOUNCE":
+            continue
+        d = ev.get("details") or ""
+        m_sub = re.search(r"subnet\s*=\s*(\d+)", d, re.I)
+        if m_sub and m_sub.group(1) != "1":
+            continue
+        m_ch = re.search(r"cluster_head\s*=\s*(\d+)", d, re.I)
+        if not m_ch:
+            continue
+        ch = int(m_ch.group(1))
+        reason = "unknown"
+        m_re = re.search(r"\breason\s*=\s*(\S+)", d, re.I)
+        if m_re:
+            reason = m_re.group(1).strip()
+        try:
+            t = float(ev.get("t", 0))
+        except (TypeError, ValueError):
+            t = 0.0
+        hist.append({"time": t, "ch": ch, "reason": reason})
+    hist.sort(key=lambda x: (x["time"], x["ch"]))
+    return hist
 
 
 def get_power_off_time_from_jsonl(jsonl_records, energy_threshold=0.01):
@@ -775,14 +802,42 @@ def build_node_states_from_jsonl(records, time_bucket=0.5):
             entry["y"] = r.get("pos_y")
         if role:
             entry["role"] = role
+        js = (r.get("join_state") or "").strip()
+        if js:
+            entry["join_state"] = js
         by_t[t_b][nid] = entry
     return by_t
+
+
+def align_join_state_with_join_config(node_states_by_time, join_time_map):
+    """快照时间已晚于 join_config 的 join_time 时，强制 join_state=joined，避免 JSONL 在接口刚 Up 前误标 pending/offline。"""
+    if not node_states_by_time or not join_time_map:
+        return
+    for t_str, bucket in node_states_by_time.items():
+        try:
+            t_b = float(t_str)
+        except (TypeError, ValueError):
+            continue
+        for nid_str, st in list(bucket.items()):
+            try:
+                nid = int(nid_str)
+            except (TypeError, ValueError):
+                continue
+            jt = join_time_map.get(nid)
+            if jt is None:
+                continue
+            if t_b + 1e-9 >= float(jt):
+                if not isinstance(st, dict):
+                    st = {}
+                st["join_state"] = "joined"
+                bucket[nid_str] = st
 
 
 def merge_jsonl_best_ip_role_into_topology(nodes, jsonl_records):
     """每条节点取最后一次非空 ip/role，避免仅用文件末行且空 ip 导致拓扑丢地址。"""
     best_ip = {}
     best_role = {}
+    best_join_state = {}
     for r in jsonl_records:
         nid = r["nodeId"]
         ip = (r.get("ip") or "").strip()
@@ -791,12 +846,17 @@ def merge_jsonl_best_ip_role_into_topology(nodes, jsonl_records):
         ro = (r.get("role") or "").strip()
         if ro:
             best_role[nid] = ro
+        js = (r.get("join_state") or "").strip()
+        if js:
+            best_join_state[nid] = js
     for n in nodes:
         nid = n["id"]
         if nid in best_ip:
             n["ip"] = best_ip[nid]
         if nid in best_role:
             n["role"] = best_role[nid]
+        if nid in best_join_state:
+            n["joinState"] = best_join_state[nid]
 
 
 def ensure_mesh_links(nodes, links, role_by_node, subnet_by_node, join_time):
@@ -886,6 +946,7 @@ def run(dir_path, out_dir, join_config_path=None):
                 nid, jt = n["node_id"], n["join_time"]
                 join_time[nid] = jt
             break
+    align_join_state_with_join_config(node_states_by_time, join_time)
     # 用 join_config 补全 subnet，且当事件未推断出 Adhoc/DataLink SPN 时指定默认 SPN，保证自组网/数据链在拓扑中始终显示一个 SPN
     if join_config:
         for n in join_config:
@@ -1062,7 +1123,16 @@ def run(dir_path, out_dir, join_config_path=None):
             if not join_config and n["id"] in positions_by_node and positions_by_node[n["id"]]:
                 n["positions"] = [{"t": t, "x": x, "y": y} for t, x, y in positions_by_node[n["id"]]]
 
-    topology = {"nodes": nodes, "links": links}
+    ch_hist = extract_adhoc_ch_elect_history(events)
+    last_ch = ch_hist[-1]["ch"] if ch_hist else None
+    topology = {
+        "nodes": nodes,
+        "links": links,
+        "adhocCluster": {
+            "clusterHead": last_ch,
+            "chElectHistory": ch_hist,
+        },
+    }
     topo_path = os.path.join(out_dir, "topology.json")
     with open(topo_path, "w", encoding="utf-8") as f:
         json.dump(topology, f, ensure_ascii=False, indent=2)
@@ -1162,7 +1232,9 @@ def run(dir_path, out_dir, join_config_path=None):
             json.dump({
                 "flowmonXml": flowmon_xml,
                 "stateDrivenKpiJson": state_driven_kpi_json,
-                "eventsCount": len(events)
+                "eventsCount": len(events),
+                "adhocChElectCount": len(ch_hist),
+                "adhocClusterHead": last_ch,
             }, f, indent=2)
         print("已写入:", meta_path)
 
