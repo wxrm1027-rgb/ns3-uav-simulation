@@ -878,32 +878,12 @@
       var r = (isAdhocNode && isChAdhoc && !preAd) ? rBase * 1.3 : rBase;
 
       if (netSt.kind === 'offline') {
-        var labelOff = (n.label || ('N' + n.id)) + ' (退网)';
-        var titleAttrOff = labelOff;
         svg += '<circle cx="' + cx + '" cy="' + cy + '" r="' + r + '" fill="#CCCCCC" fill-opacity="0.5" stroke="none" filter="url(#nodeShadow)" data-node-id="' + n.id + '" class="node-circle node-offline-unified">' + fadeAnim + '</circle>';
-        var regionOff = getSubnetRegion(n);
-        if (regionOff === 'left') {
-          svg += '<text x="' + (cx - r - 6) + '" y="' + cy + '" text-anchor="end" dominant-baseline="middle" font-size="8" fill="#aaa" class="node-label"><title>' + titleAttrOff + '</title>' + labelOff + '</text>';
-        } else if (regionOff === 'right') {
-          svg += '<text x="' + (cx + r + 6) + '" y="' + cy + '" text-anchor="start" dominant-baseline="middle" font-size="8" fill="#aaa" class="node-label"><title>' + titleAttrOff + '</title>' + labelOff + '</text>';
-        } else {
-          svg += '<text x="' + cx + '" y="' + (cy + r + 10) + '" text-anchor="middle" font-size="8" fill="#aaa" class="node-label"><title>' + titleAttrOff + '</title>' + labelOff + '</text>';
-        }
         continue;
       }
 
       if (netSt.kind === 'pending_join' || netSt.kind === 'not_joined') {
-        var labelNj = (n.label || ('N' + n.id)) + ' (待入网)';
-        var titleNj = labelNj;
         svg += '<circle cx="' + cx + '" cy="' + cy + '" r="' + r + '" fill="' + COLORS.notJoined + '" fill-opacity="0.35" stroke="#5a6a80" stroke-width="1.5" stroke-dasharray="4,3" filter="url(#nodeShadow)" data-node-id="' + n.id + '" class="node-circle node-not-joined">' + fadeAnim + '</circle>';
-        var regionNj = getSubnetRegion(n);
-        if (regionNj === 'left') {
-          svg += '<text x="' + (cx - r - 6) + '" y="' + cy + '" text-anchor="end" dominant-baseline="middle" font-size="8" fill="#889" class="node-label"><title>' + titleNj + '</title>' + labelNj + '</text>';
-        } else if (regionNj === 'right') {
-          svg += '<text x="' + (cx + r + 6) + '" y="' + cy + '" text-anchor="start" dominant-baseline="middle" font-size="8" fill="#889" class="node-label"><title>' + titleNj + '</title>' + labelNj + '</text>';
-        } else {
-          svg += '<text x="' + cx + '" y="' + (cy + r + 10) + '" text-anchor="middle" font-size="8" fill="#889" class="node-label"><title>' + titleNj + '</title>' + labelNj + '</text>';
-        }
         continue;
       }
 
@@ -968,8 +948,6 @@
         svg += '<circle cx="' + cx + '" cy="' + cy + '" r="' + r + '" fill="' + color + '" stroke="' + strokeColor + '" stroke-width="' + strokeW + '" filter="url(#nodeShadow)" data-node-id="' + n.id + '" class="node-circle">' + fadeAnim + '</circle>';
       }
 
-      var label = n.label || ('N' + n.id);
-      if (isChAdhoc && !preAd) label += ' [CH]';
       var tag = '';
       if (isAdhocNode) {
         if (preAd) tag = 'TSN Node';
@@ -989,16 +967,7 @@
         tag = ((roleNow === 'spn' || roleNow === 'primary_spn') ? 'Primary SPN'
           : ((roleNow === 'standby_spn' || roleNow === 'backup_spn') ? 'Backup SPN' : ''));
       }
-      var region = getSubnetRegion(n);
-      var titleAttr = (n.label || 'Node-' + n.id) + (tag ? ' [' + tag + ']' : '');
-      if (region === 'left') {
-        svg += '<text x="' + (cx - r - 6) + '" y="' + cy + '" text-anchor="end" dominant-baseline="middle" font-size="8" fill="#aaa" class="node-label"><title>' + titleAttr + '</title>' + label + '</text>';
-      } else if (region === 'right') {
-        svg += '<text x="' + (cx + r + 6) + '" y="' + cy + '" text-anchor="start" dominant-baseline="middle" font-size="8" fill="#aaa" class="node-label"><title>' + titleAttr + '</title>' + label + '</text>';
-      } else {
-        svg += '<text x="' + cx + '" y="' + (cy + r + 10) + '" text-anchor="middle" font-size="8" fill="#aaa" class="node-label"><title>' + titleAttr + '</title>' + label + '</text>';
-      }
-      if (tag) svg += '<text x="' + cx + '" y="' + (cy + r + 18) + '" text-anchor="middle" font-size="7" fill="#666">' + tag + '</text>';
+      // 根据需求隐藏节点旁灰色文字（名称与角色标签），仅保留节点图形
     }
     svg += '</g></svg>';
     topologyEl.innerHTML = svg;

@@ -9,10 +9,73 @@
 
 namespace NmsPacketParse
 {
-static bool g_enablePacketParse = false;
+static bool g_enablePacketParse = true;
 
 void SetEnable (bool enable) { g_enablePacketParse = enable; }
 bool IsEnabled () { return g_enablePacketParse; }
+
+/// 单行业务日志：HNMP 头 + 多段 TLV 摘要（兼容旧版 3 字节 HNMP 头）
+static std::string
+FormatHnmpTlvTraceLine (const char* direction, uint32_t nodeId,
+                        ns3::Ipv4Address srcAddr, ns3::Ipv4Address dstAddr, uint16_t srcPort,
+                        uint16_t dstPort, const uint8_t* data, uint32_t len)
+{
+  std::ostringstream biz;
+  biz << "dir=" << direction << " node=" << nodeId << " src=" << srcAddr << ":" << srcPort
+      << " dst=" << dstAddr << ":" << dstPort << " bytes=" << len;
+  uint32_t off = 0;
+  if (len >= 6 && len == 6u + data[5])
+    {
+      off = 6;
+      biz << " hnmp=ft=0x" << std::hex << static_cast<int> (data[0]) << " qos=" << static_cast<int> (data[1])
+          << " srcId=" << static_cast<int> (data[2]) << " dstId=" << static_cast<int> (data[3])
+          << " seq=" << static_cast<int> (data[4]) << " payLen=" << static_cast<int> (data[5]) << std::dec;
+    }
+  else if (len >= 3 && len == 3u + data[2])
+    {
+      off = 3;
+      biz << " hnmp=legacy3B ft=0x" << std::hex << static_cast<int> (data[0]) << " qos="
+          << static_cast<int> (data[1]) << " payLen=" << static_cast<int> (data[2]) << std::dec;
+    }
+  else if (len >= 6)
+    {
+      off = 6;
+      biz << " hnmp=ft=0x" << std::hex << static_cast<int> (data[0]) << " qos=" << static_cast<int> (data[1])
+          << " srcId=" << static_cast<int> (data[2]) << " dstId=" << static_cast<int> (data[3])
+          << " seq=" << static_cast<int> (data[4]) << " payLen=" << static_cast<int> (data[5])
+          << std::dec << " (parse-unverified)";
+    }
+  else if (len >= 3)
+    {
+      biz << " payload=rawTlv";
+      off = 0;
+    }
+  else
+    {
+      return biz.str () + " payload=tooShort";
+    }
+  bool first = true;
+  while (off + 3 <= len)
+    {
+      uint16_t vlen = (static_cast<uint16_t> (data[off + 1]) << 8) | data[off + 2];
+      if (off + 3u + vlen > len)
+        {
+          break;
+        }
+      if (first)
+        {
+          biz << " | ";
+          first = false;
+        }
+      else
+        {
+          biz << " ; ";
+        }
+      biz << ParseTlvValue (data + off, 3u + vlen);
+      off += 3u + vlen;
+    }
+  return biz.str ();
+}
 
 std::string ToHex (const uint8_t* data, uint32_t len, uint32_t maxBytes)
 {
@@ -87,73 +150,36 @@ void LogDataPacket (uint32_t nodeId, const char* direction,
                     const uint8_t* data, uint32_t len)
 {
   if (!IsEnabled () || len == 0) return;
-  std::ostringstream oss;
-  oss << "[" << direction << "] NodeId=" << nodeId
-      << " Src=" << srcAddr << ":" << srcPort << " Dst=" << dstAddr << ":" << dstPort
-      << " Size=" << len << "B";
-  NmsLog ("INFO", nodeId, "PKT_PARSE", oss.str ());
-  oss.str (""); oss << "  HEX: " << ToHex (data, len);
-  NmsLog ("INFO", nodeId, "PKT_PARSE", oss.str ());
-  if (len >= 6)
-    {
-      uint8_t frameType = data[0], qos = data[1], src = data[2], dst = data[3], seq = data[4], payloadLen = data[5];
-      oss.str ("");
-      oss << "  HNMP-Header: frameType=" << static_cast<uint32_t> (frameType)
-          << " qos=" << static_cast<uint32_t> (qos)
-          << " srcId=" << static_cast<uint32_t> (src)
-          << " dstId=" << static_cast<uint32_t> (dst)
-          << " seq=" << static_cast<uint32_t> (seq)
-          << " payloadLen=" << static_cast<uint32_t> (payloadLen)
-          << " totalLen=" << len;
-      NmsLog ("INFO", nodeId, "PKT_PARSE", oss.str ());
-      uint32_t off = 6;
-      uint32_t idx = 0;
-      while (off + 3 <= len)
-        {
-          uint16_t vlen = (static_cast<uint16_t> (data[off + 1]) << 8) | data[off + 2];
-          if (off + 3u + vlen > len) break;
-          std::string tlvDesc = ParseTlvValue (data + off, 3u + vlen);
-          oss.str ("");
-          oss << "  TLV[" << idx++ << "]: " << tlvDesc << ", frameLen=" << (3u + vlen);
-          NmsLog ("INFO", nodeId, "PKT_PARSE", oss.str ());
-          off += 3u + vlen;
-        }
-    }
-  else if (len >= 3)
-    {
-      std::string tlvDesc = ParseTlvValue (data, len);
-      oss.str (""); oss << "  TLV: " << tlvDesc << ", totalLen=" << len;
-      NmsLog ("INFO", nodeId, "PKT_PARSE", oss.str ());
-    }
+  NmsLog ("INFO", nodeId, "TLV_TRACE", FormatHnmpTlvTraceLine (direction, nodeId, srcAddr, dstAddr, srcPort,
+                                                               dstPort, data, len));
 }
 
 void LogHelloPacket (uint32_t nodeId, const char* direction,
                      ns3::Ipv4Address fromAddr, uint16_t fromPort,
                      const uint8_t* data, uint32_t len)
 {
-  if (!IsEnabled ()) return;
-  std::ostringstream oss;
-  oss << "[" << direction << "] NodeId=" << nodeId << " From=" << fromAddr << ":" << fromPort
-      << " Size=" << len << "B HEX: " << ToHex (data, len);
-  if (len >= 8)
+  if (!IsEnabled () || len == 0) return;
+  std::ostringstream biz;
+  biz << "dir=" << direction << " node=" << nodeId << " peer=" << fromAddr << ":" << fromPort << " bytes=" << len;
+  if (len >= 3)
     {
-      double score = 0.0;
-      std::memcpy (&score, data, 8);
-      oss << " Score=" << std::fixed << std::setprecision (3) << score;
+      biz << " | " << ParseTlvValue (data, len);
     }
-  NmsLog ("INFO", nodeId, "PKT_PARSE_HELLO", oss.str ());
+  NmsLog ("INFO", nodeId, "HELLO_TRACE", biz.str ());
 }
 
 void LogPolicyPacket (uint32_t nodeId, const char* direction,
                       ns3::Ipv4Address fromAddr, uint16_t fromPort,
                       const uint8_t* data, uint32_t len)
 {
-  if (!IsEnabled ()) return;
-  std::ostringstream oss;
-  oss << "[" << direction << "] NodeId=" << nodeId << " From=" << fromAddr << ":" << fromPort
-      << " Size=" << len << "B " << ToHex (data, std::min (len, 32u));
-  if (len >= 3) oss << " " << ParseTlvValue (data, len);
-  NmsLog ("INFO", nodeId, "PKT_PARSE_POLICY", oss.str ());
+  if (!IsEnabled () || len == 0) return;
+  std::ostringstream biz;
+  biz << "dir=" << direction << " node=" << nodeId << " peer=" << fromAddr << ":" << fromPort << " bytes=" << len;
+  if (len >= 3)
+    {
+      biz << " | " << ParseTlvValue (data, len);
+    }
+  NmsLog ("INFO", nodeId, "POLICY_TRACE", biz.str ());
 }
 } // namespace NmsPacketParse
 

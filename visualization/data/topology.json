@@ -8,8 +8,8 @@
       "x": 0.0,
       "y": 0.0,
       "joinTime": 0.0,
-      "speed": 0.0,
       "ip": "10.100.0.1",
+      "speed": 0.0,
       "joinState": "joined",
       "energy": 1.0,
       "link_quality": 0.95
@@ -22,40 +22,40 @@
       "x": 100.0,
       "y": 100.0,
       "joinTime": 0.0,
-      "speed": 0.0,
       "ip": "10.1.0.1",
+      "speed": 3.0,
       "joinState": "joined",
-      "energy": 0.25,
-      "link_quality": 0.915
+      "energy": 0.5,
+      "link_quality": 0.477
     },
     {
       "id": 2,
       "label": "Node-2",
-      "role": "PRIMARY_SPN",
+      "role": "BACKUP_SPN",
       "subnet": "adhoc",
-      "x": 110.0,
+      "x": 120.0,
       "y": 100.0,
       "joinTime": 0.0,
-      "speed": 0.0,
-      "offlineTime": 80.0,
       "ip": "10.1.0.2",
+      "speed": 12.0,
+      "offlineTime": 80.0,
       "joinState": "offline",
-      "energy": 0.85,
+      "energy": 0.8,
       "link_quality": 0.9
     },
     {
       "id": 3,
       "label": "Node-3",
-      "role": "BACKUP_SPN",
+      "role": "TSN",
       "subnet": "adhoc",
-      "x": 105.0,
-      "y": 105.0,
+      "x": 100.0,
+      "y": 120.0,
       "joinTime": 5.0,
-      "speed": 0.0,
-      "offlineTime": 55.0,
       "ip": "10.1.0.3",
+      "speed": 13.0,
+      "offlineTime": 55.0,
       "joinState": "offline",
-      "energy": 0.95,
+      "energy": 0.75,
       "link_quality": 0.95
     },
     {
@@ -63,14 +63,14 @@
       "label": "Node-4",
       "role": "BACKUP_SPN",
       "subnet": "adhoc",
-      "x": 100.0,
-      "y": 110.0,
+      "x": 80.0,
+      "y": 100.0,
       "joinTime": 0.0,
-      "speed": 0.0,
-      "offlineTime": 50.0,
       "ip": "10.1.0.4",
+      "speed": 11.0,
+      "offlineTime": 50.0,
       "joinState": "offline",
-      "energy": 0.85,
+      "energy": 0.58,
       "link_quality": 0.9
     },
     {
@@ -78,28 +78,28 @@
       "label": "Node-5",
       "role": "BACKUP_SPN",
       "subnet": "adhoc",
-      "x": 110.0,
-      "y": 110.0,
+      "x": 100.0,
+      "y": 80.0,
       "joinTime": 0.0,
-      "speed": 0.0,
       "ip": "10.1.0.5",
+      "speed": 10.0,
       "joinState": "joined",
-      "energy": 0.25,
-      "link_quality": 0.957
+      "energy": 0.26,
+      "link_quality": 0.91
     },
     {
       "id": 6,
-      "label": "Node-6",
-      "role": "TSN",
+      "label": "SPN-6",
+      "role": "PRIMARY_SPN",
       "subnet": "datalink",
       "x": 220.0,
       "y": 20.0,
       "joinTime": 0.0,
-      "speed": 15.0,
       "ip": "10.2.0.1",
+      "speed": 15.0,
       "joinState": "joined",
-      "energy": 0.25,
-      "link_quality": 0.981
+      "energy": 0.35,
+      "link_quality": 0.983
     },
     {
       "id": 7,
@@ -109,39 +109,39 @@
       "x": 245.0,
       "y": 30.0,
       "joinTime": 0.0,
-      "speed": 16.0,
       "ip": "10.2.0.2",
+      "speed": 16.0,
       "joinState": "joined",
-      "energy": 0.25,
-      "link_quality": 0.944
+      "energy": 0.35,
+      "link_quality": 0.64
     },
     {
       "id": 8,
-      "label": "SPN-8",
-      "role": "PRIMARY_SPN",
+      "label": "Node-8",
+      "role": "BACKUP_SPN",
       "subnet": "datalink",
       "x": 270.0,
       "y": 20.0,
       "joinTime": 0.0,
-      "speed": 17.0,
       "ip": "10.2.0.3",
+      "speed": 17.0,
       "joinState": "joined",
-      "energy": 0.25,
-      "link_quality": 0.931
+      "energy": 0.35,
+      "link_quality": 0.768
     },
     {
       "id": 9,
       "label": "Node-9",
-      "role": "BACKUP_SPN",
+      "role": "TSN",
       "subnet": "datalink",
       "x": 295.0,
       "y": 30.0,
       "joinTime": 0.0,
-      "speed": 18.0,
       "ip": "10.2.0.4",
+      "speed": 18.0,
       "joinState": "joined",
-      "energy": 0.25,
-      "link_quality": 0.902
+      "energy": 0.35,
+      "link_quality": 0.624
     },
     {
       "id": 10,
@@ -151,11 +151,11 @@
       "x": 50.0,
       "y": 50.0,
       "joinTime": 0.0,
-      "speed": 0.0,
       "ip": "10.0.0.5",
+      "speed": 0.0,
       "joinState": "joined",
-      "energy": 0.994,
-      "link_quality": 0.988
+      "energy": 0.995,
+      "link_quality": 0.955
     },
     {
       "id": 11,
@@ -165,11 +165,11 @@
       "x": 10.0,
       "y": 10.0,
       "joinTime": 0.0,
-      "speed": 0.0,
       "ip": "7.0.0.2",
+      "speed": 4.0,
       "joinState": "joined",
-      "energy": 0.874,
-      "link_quality": 0.906
+      "energy": 0.875,
+      "link_quality": 1.0
     },
     {
       "id": 12,
@@ -179,11 +179,11 @@
       "x": 25.0,
       "y": 25.0,
       "joinTime": 10.0,
-      "speed": 0.0,
       "ip": "7.0.0.3",
+      "speed": 5.0,
       "joinState": "joined",
-      "energy": 0.945,
-      "link_quality": 0.984
+      "energy": 0.946,
+      "link_quality": 0.909
     },
     {
       "id": 13,
@@ -193,11 +193,11 @@
       "x": 40.0,
       "y": 10.0,
       "joinTime": 12.0,
-      "speed": 0.0,
       "ip": "7.0.0.4",
+      "speed": 6.0,
       "joinState": "joined",
-      "energy": 0.875,
-      "link_quality": 0.835
+      "energy": 0.876,
+      "link_quality": 0.904
     },
     {
       "id": 14,
@@ -207,11 +207,11 @@
       "x": 55.0,
       "y": 25.0,
       "joinTime": 14.0,
-      "speed": 0.0,
       "ip": "7.0.0.5",
+      "speed": 5.5,
       "joinState": "joined",
-      "energy": 0.875,
-      "link_quality": 0.879
+      "energy": 0.876,
+      "link_quality": 0.912
     },
     {
       "id": 15,
@@ -221,11 +221,11 @@
       "x": 85.0,
       "y": 35.0,
       "joinTime": 16.0,
-      "speed": 0.0,
       "ip": "7.0.0.6",
+      "speed": 6.5,
       "joinState": "joined",
-      "energy": 0.875,
-      "link_quality": 0.851
+      "energy": 0.876,
+      "link_quality": 0.926
     }
   ],
   "links": [
@@ -236,26 +236,20 @@
       "t": 0.0
     },
     {
-      "from": 2,
+      "from": 1,
       "to": 3,
       "type": "data",
       "t": 5.0
     },
     {
-      "from": 2,
-      "to": 5,
+      "from": 1,
+      "to": 4,
       "type": "data",
       "t": 0.0
     },
     {
-      "from": 3,
-      "to": 4,
-      "type": "data",
-      "t": 5.0
-    },
-    {
-      "from": 2,
-      "to": 4,
+      "from": 1,
+      "to": 5,
       "type": "data",
       "t": 0.0
     },
@@ -321,48 +315,53 @@
     },
     {
       "from": 0,
-      "to": 8,
+      "to": 6,
       "type": "backhaul",
       "t": 0.0
     }
   ],
   "adhocCluster": {
-    "clusterHead": 5,
+    "clusterHead": 1,
     "chElectHistory": [
       {
         "time": 0.19,
+        "ch": 1,
+        "reason": "after_spn_elect"
+      },
+      {
+        "time": 0.19,
+        "ch": 1,
+        "reason": "ch_elect"
+      },
+      {
+        "time": 0.19,
+        "ch": 1,
+        "reason": "ch_elect"
+      },
+      {
+        "time": 5.19,
         "ch": 5,
         "reason": "after_spn_elect"
       },
       {
         "time": 5.25,
-        "ch": 3,
-        "reason": "late_join_ch"
+        "ch": 5,
+        "reason": "ch_elect"
+      },
+      {
+        "time": 35.25,
+        "ch": 1,
+        "reason": "periodic_margin_two_periods"
       },
       {
         "time": 50.09,
-        "ch": 3,
+        "ch": 1,
         "reason": "after_spn_elect"
-      },
-      {
-        "time": 55.09,
-        "ch": 2,
-        "reason": "after_spn_elect"
-      },
-      {
-        "time": 55.12,
-        "ch": 2,
-        "reason": "ch_elect"
       },
       {
         "time": 80.09,
-        "ch": 5,
+        "ch": 1,
         "reason": "after_spn_elect"
-      },
-      {
-        "time": 80.12,
-        "ch": 5,
-        "reason": "ch_elect"
       }
     ]
   }

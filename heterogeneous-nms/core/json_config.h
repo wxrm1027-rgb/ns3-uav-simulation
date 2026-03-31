@@ -21,6 +21,7 @@ struct NodeJoinConfig
   double initialEnergy;
   double initialEnergyMah;
   double initialLinkQuality;
+  double staticComputeCapability;
   std::vector<uint32_t> neighbors;
 };
 

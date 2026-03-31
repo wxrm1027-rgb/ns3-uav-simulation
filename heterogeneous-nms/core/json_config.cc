@@ -46,7 +46,7 @@ LoadNodeJoinConfig (const std::string& path)
     {
       NodeJoinConfig c = {};
       c.initPos[0] = c.initPos[1] = c.initPos[2] = 0.0;
-      c.initialRateMbps = c.initialEnergy = c.initialEnergyMah = c.initialLinkQuality = -1.0;
+      c.initialRateMbps = c.initialEnergy = c.initialEnergyMah = c.initialLinkQuality = c.staticComputeCapability = -1.0;
       auto skipToVal = [&content, &i] (const std::string& key) -> size_t {
         size_t p = content.find (key, i);
         if (p == std::string::npos) return std::string::npos;
@@ -108,6 +108,8 @@ LoadNodeJoinConfig (const std::string& path)
       if (pEmah != std::string::npos) c.initialEnergyMah = getNum (pEmah);
       size_t pLq = skipToVal ("\"initial_link_quality\"");
       if (pLq != std::string::npos) c.initialLinkQuality = getNum (pLq);
+      size_t pComp = skipToVal ("\"static_compute_capability\"");
+      if (pComp != std::string::npos) c.staticComputeCapability = getNum (pComp);
       size_t pNeigh = content.find ("\"neighbors\"", i);
       if (pNeigh != std::string::npos && pNeigh < content.find ("\"node_id\"", i + 10))
         {
@@ -153,6 +155,9 @@ ValidateJoinConfig (const std::map<uint32_t, NodeJoinConfig>& config)
         return "JoinConfig: initial_energy must be [0,1] node_id=" + std::to_string (c.nodeId);
       if (c.initialLinkQuality >= 0.0 && c.initialLinkQuality > 1.0)
         return "JoinConfig: initial_link_quality must be [0,1] node_id=" + std::to_string (c.nodeId);
+      if (c.staticComputeCapability >= 0.0 &&
+          (c.staticComputeCapability <= 0.0 || c.staticComputeCapability > 1.0))
+        return "JoinConfig: static_compute_capability must be (0,1] node_id=" + std::to_string (c.nodeId);
     }
   std::vector<std::pair<double, uint32_t>> order;
   for (const auto& kv : config) order.push_back ({kv.second.joinTime, kv.second.nodeId});

@@ -1,4 +1,9 @@
 {
+  "_notes": {
+    "routing": "route_mode/route_adapt/route_adapt_runtime* 参数用于自组网路由管理策略。DataLink 固定为 managed_datalink（静态受管转发）。",
+    "priority": "命令行参数优先级高于 config.json；若未显式传 CLI 参数，则使用此处配置。",
+    "runtime_export": "每次仿真结束自动执行：python3 export_visualization_data.py simulation_results/<timestamp> -o visualization/data"
+  },
   "spn": {
     "election_wait_time": 2.0,
     "hello_interval": 0.5,
@@ -19,6 +24,33 @@
   },
   "simulation": {
     "total_time": 100.0,
-    "num_nodes": 30
+    "num_nodes": 30,
+    "join_config": "docs/heterogeneous-nms/join_config.json",
+    "scenario_config": "docs/heterogeneous-nms/scenario_config.json",
+    "scenario_mode": "normal",
+    "parse_packets": 1,
+    "pcap": 0,
+    "dual_channel": 0,
+    "energy_delta_th": 0.15,
+    "state_suppress_win": 15.0,
+    "aggregate_interval": 2.0,
+    "route_mode": "auto",
+    "route_adapt": "auto",
+    "route_adapt_runtime": 0,
+    "route_adapt_runtime_window": 5.0,
+    "route_adapt_runtime_cooldown": 20.0,
+    "_join_scenario_note": "join_config/scenario_config 可写仓库相对路径；为空时仍会回退代码内默认探测。",
+    "_scenario_mode_note": "normal|thesis30|compare-baseline|compare-hnmp",
+    "_parse_packets_note": "1=输出 TLV/HNMP 解析日志（TLV_TRACE 等），0=关闭。",
+    "_pcap_note": "1=启用 pcap 抓包与离线解析，0=关闭。",
+    "_dual_channel_note": "1=控制/数据端口分离（8888/9999），0=单通道。",
+    "_energy_delta_note": "DataLink 状态触发阈值，对应 CLI: --energyDeltaTh。",
+    "_state_suppress_note": "状态抑制窗口秒数，对应 CLI: --stateSuppressWin。",
+    "_aggregate_interval_note": "SPN 聚合上报周期秒数，对应 CLI: --aggregateInterval。",
+    "_route_mode_note": "auto|aodv|olsr，仅作用于 Adhoc。DataLink 始终静态受管模式。",
+    "_route_adapt_note": "auto|stable|degraded|critical，映射 OLSR/AODV 参数档位（当前主要用于 OLSR）。",
+    "_route_adapt_runtime_note": "0=关闭（默认，不改变原行为）；1=开启运行时 OLSR 调参。",
+    "_route_adapt_runtime_window_note": "运行时指标评估窗口（秒）。",
+    "_route_adapt_runtime_cooldown_note": "运行时档位切换冷却时间（秒）。"
   }
 }

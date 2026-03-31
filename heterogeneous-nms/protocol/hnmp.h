@@ -24,6 +24,7 @@ enum FrameType : uint8_t
   FRAME_POLICY   = 0x05,
 };
 
+/// implicitCompact3B=true：仅 3 字节头（ft,qos,payloadLen），用于兼容旧版或离线解析；新仿真默认用 false（6 字节全头）
 uint32_t EncodeFrame (uint8_t* out,
                       uint32_t outSize,
                       const Header& h,

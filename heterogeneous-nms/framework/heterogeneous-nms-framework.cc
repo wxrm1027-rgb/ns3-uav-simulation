@@ -45,6 +45,7 @@
 #include <ctime>
 #include <fstream>
 #include <iomanip>
+#include <array>
 #include <map>
 #include <set>
 #include <sstream>
@@ -118,6 +119,7 @@ struct NodeJoinConfig
   double initialEnergy;      ///< 初始能量 [0,1]，<0 表示不覆盖
   double initialEnergyMah;   ///< 初始能量 mAh（可选，用于显示/能耗模型）
   double initialLinkQuality; ///< 初始链路质量 [0,1] 或 RSSI 归一化，<0 表示不覆盖
+  double staticComputeCapability; ///< 静态算力能力 [0,1]，<0 表示不覆盖
   std::vector<uint32_t> neighbors;  ///< 逻辑拓扑：与该节点存在链路的邻居 node_id 列表（用于 MatrixPropagationLossModel）
 };
 
@@ -138,7 +140,7 @@ LoadNodeJoinConfig (const std::string& path)
     {
       NodeJoinConfig c = {};
       c.initPos[0] = c.initPos[1] = c.initPos[2] = 0.0;
-      c.initialRateMbps = c.initialEnergy = c.initialEnergyMah = c.initialLinkQuality = -1.0;
+      c.initialRateMbps = c.initialEnergy = c.initialEnergyMah = c.initialLinkQuality = c.staticComputeCapability = -1.0;
       auto skipToVal = [&content, &i] (const std::string& key) -> size_t {
         size_t p = content.find (key, i);
         if (p == std::string::npos) return std::string::npos;
@@ -205,6 +207,8 @@ LoadNodeJoinConfig (const std::string& path)
       if (pEmah != std::string::npos) c.initialEnergyMah = getNum (pEmah);
       size_t pLq = skipToVal ("\"initial_link_quality\"");
       if (pLq != std::string::npos) c.initialLinkQuality = getNum (pLq);
+      size_t pComp = skipToVal ("\"static_compute_capability\"");
+      if (pComp != std::string::npos) c.staticComputeCapability = getNum (pComp);
       // 解析 "neighbors": [id1, id2, ...]（逻辑拓扑，用于 MatrixPropagationLossModel）
       size_t pNeigh = content.find ("\"neighbors\"", i);
       if (pNeigh != std::string::npos && pNeigh < content.find ("\"node_id\"", i + 10))
@@ -271,6 +275,9 @@ ValidateJoinConfig (const std::map<uint32_t, NodeJoinConfig>& config)
         return "JoinConfig: initial_energy must be [0,1] node_id=" + std::to_string (c.nodeId);
       if (c.initialLinkQuality >= 0.0 && c.initialLinkQuality > 1.0)
         return "JoinConfig: initial_link_quality must be [0,1] node_id=" + std::to_string (c.nodeId);
+      if (c.staticComputeCapability >= 0.0 &&
+          (c.staticComputeCapability <= 0.0 || c.staticComputeCapability > 1.0))
+        return "JoinConfig: static_compute_capability must be (0,1] node_id=" + std::to_string (c.nodeId);
     }
   std::vector<std::pair<double, uint32_t>> order;
   for (const auto& kv : config) order.push_back ({kv.second.joinTime, kv.second.nodeId});
@@ -1274,7 +1281,8 @@ public:
   void SetJoinTime (double joinTimeSec);
   /// 论文 4.5.2/4.6：上报抑制与聚合参数
   void SetProtocolTunables (double energyDeltaThreshold, double suppressWindowSec, double aggregateIntervalSec);
-  void SetSpnElectionTunables (double electionTimeoutSec, uint8_t heartbeatMissThreshold);
+  void SetSpnElectionTunables (double electionTimeoutSec, uint8_t heartbeatMissThreshold, double deltaTh = -1.0);
+  void SetStaticComputeCapability (double capability);
 
   /// 事件注入：强制节点失效（能量置 0、停止发包、关闭 socket），用于模拟断电/宕机
   void ForceFail ();
@@ -1352,6 +1360,48 @@ private:
 
   /// 计算多属性效用评分 Score
   double CalculateUtilityScore ();
+  struct WeightVector
+  {
+    double wEnergy;
+    double wTopo;
+    double wLink;
+    double wComp;
+  };
+  struct SpnCandidateInfo
+  {
+    uint32_t nodeId {0};
+    SubnetType subnetType {SUBNET_ADHOC};
+    double L_energy {0.0};
+    double L_mobility {0.0};
+    double L_struct {0.0};
+    double L_topo {0.0};
+    double L_link {0.0};
+    double L_comp_static {1.0};
+    double rho_queue {0.0};
+    double L_comp {0.0};
+    double totalScore {0.0};
+    bool disqualified {false};
+  };
+  double ComputeLmobility (double speedMps) const;
+  double ComputeLstruct (uint32_t nodeId,
+                         SubnetType subnetType,
+                         const std::vector<uint32_t>& oneHopNeighbors,
+                         const std::vector<uint32_t>& twoHopNeighbors,
+                         uint32_t clusterSize) const;
+  double ComputeLtopo (uint32_t nodeId,
+                       SubnetType subnetType,
+                       double speedMps,
+                       const std::vector<uint32_t>& oneHopNeighbors,
+                       const std::vector<uint32_t>& twoHopNeighbors,
+                       uint32_t clusterSize) const;
+  double ComputeLlink (uint32_t nodeId,
+                       const std::map<uint32_t, double>& neighborSinrMap) const;
+  double ComputeLcomp (double staticCapability, double queueOccupancy, bool* disqualified) const;
+  double ComputeSpnScore (const SpnCandidateInfo& info, SubnetType subnetType) const;
+  std::vector<uint32_t> GetOneHopNeighbors () const;
+  std::vector<uint32_t> GetTwoHopNeighborsProxy () const;
+  uint32_t GetSubnetClusterSize () const;
+  std::map<uint32_t, double> BuildNeighborSinrProxyMap () const;
 
   /// 广播携带自身 Score 的 Hello 包（Ad-hoc / DataLink）
   void SendHello (double score);
@@ -1370,6 +1420,8 @@ private:
   /// 仅同步分数到共享视图并刷新本地角色（不触发主备重算、不产生 SPN_ELECT）
   void SpnMergeScoresIntoShared (double myScore);
   void ApplyLocalRoleFromShared ();
+  /// 与 RunFullElection 内逻辑一致：当仅从共享视图更新角色时（例如他节点触发选举），必须重绑心跳定时器
+  void ResyncSpnHeartbeatTimerFromRoleTransition (bool oldIsSpn, bool oldBackup);
   void SpnSyncScoresOnly (double myScore);
   /// 条件触发完整选举：首轮 / 新节点入网 / 主 SPN 持续劣化（非 STATE_CHANGE 路径）
   void MaybeTriggerSpnElection (double myScore);
@@ -1467,7 +1519,16 @@ private:
   static const double SPN_SCORE_STALE_SEC;         ///< Score 超过此秒未更新则视为节点离线
   static const double HEARTBEAT_SEC;               ///< 心跳周期（按论文实验参数可调）
   static const uint8_t HEARTBEAT_MISS_THRESHOLD;   ///< 连续丢失阈值
-  static const double SPN_SWITCH_HYSTERESIS;       ///< SPN 切换迟滞阈值
+  static const double SPN_SWITCH_HYSTERESIS;       ///< SPN 切换迟滞阈值（旧代理逻辑）
+  static const double V_TH;
+  static const double LAMBDA;
+  static const double ALPHA;
+  static const double BETA;
+  static const double GAMMA;
+  static const double SINR_MIN;
+  static const double SINR_MAX;
+  static const double DELTA_TH;
+  static const std::map<SubnetType, WeightVector> SUBNET_WEIGHTS;
   /// Score 平滑：对瞬时 UV-MIB/拓扑输入与最终得分做 EMA，抑制随机扰动导致的选举抖动
   static const double SCORE_INPUT_EMA_ALPHA;       ///< 能量/链路/拓扑度量 EMA 系数（越大越跟瞬时）
   static const double SCORE_OUTPUT_EMA_ALPHA;      ///< 最终 Score EMA 系数
@@ -1487,6 +1548,9 @@ private:
   uint32_t        m_currentPrimaryId;      ///< 当前感知的主SPN
   double          m_lastPrimaryHeartbeatTs;///< 最近收到主SPN心跳时刻
   uint8_t         m_missedHeartbeats;      ///< 连续丢心跳计数
+  uint32_t        m_heartbeatSendSeq;      ///< 主 SPN 心跳发送序号（验证日志）
+  uint32_t        m_lastSyncedCommittedPrimaryId; ///< 上次从共享状态同步的主 SPN（用于主切换时重置备用心跳跟踪）
+  double          m_backupHeartbeatGraceUntilTs; ///< 备 SPN：主切换后到此时刻前不累计心跳丢失（等待新主首包）
   bool            m_failoverPending;       ///< 已触发接管判定，等待成为主SPN
   double          m_failoverStartTs;       ///< 触发接管时刻，用于自愈耗时统计
   double          m_joinTime;             ///< 入网时间（秒），未到则应用层静默、不耗电
@@ -1534,6 +1598,9 @@ private:
   double          m_lastSpnBatteryNorm;
   double          m_lastSpnConnNorm;
   double          m_lastSpnStabNorm;
+  double          m_staticComputeCapability; ///< 静态算力能力 [0,1]
+  double          m_queueOccupancyRatio;     ///< 发送队列占用率 [0,1]（轻量监控）
+  double          m_spnDeltaThreshold;       ///< SPN 切换迟滞阈值（可配置）
   struct SpnElectHistoryEntry
   {
     double timeSec;
@@ -1654,6 +1721,9 @@ HeterogeneousNodeApp::HeterogeneousNodeApp ()
     m_currentPrimaryId (0),
     m_lastPrimaryHeartbeatTs (0.0),
     m_missedHeartbeats (0),
+    m_heartbeatSendSeq (0),
+    m_lastSyncedCommittedPrimaryId (0),
+    m_backupHeartbeatGraceUntilTs (-1.0),
     m_failoverPending (false),
     m_failoverStartTs (0.0),
     m_joinTime (0.0),
@@ -1697,6 +1767,9 @@ HeterogeneousNodeApp::HeterogeneousNodeApp ()
     m_lastSpnBatteryNorm (0.0),
     m_lastSpnConnNorm (0.0),
     m_lastSpnStabNorm (0.0),
+    m_staticComputeCapability (1.0),
+    m_queueOccupancyRatio (0.0),
+    m_spnDeltaThreshold (DELTA_TH),
     m_isClusterHead (false),
     m_chScoreSaved (),
     m_chPeriodicEvent ()
@@ -1716,9 +1789,17 @@ HeterogeneousNodeApp::~HeterogeneousNodeApp ()
 }
 
 const double HeterogeneousNodeApp::SPN_SCORE_STALE_SEC = 2.0;  // 退网后约 2s 内完成 SPN 重选，避免“SPN 消失”
-const double HeterogeneousNodeApp::HEARTBEAT_SEC = 0.25;         // 心跳检测周期 250ms，加速主故障检测
+const double HeterogeneousNodeApp::HEARTBEAT_SEC = 0.1;          // 心跳周期 100ms（论文/实验参数）
 const uint8_t HeterogeneousNodeApp::HEARTBEAT_MISS_THRESHOLD = 3; // 连续 3 次丢失判定主SPN失效
-const double HeterogeneousNodeApp::SPN_SWITCH_HYSTERESIS = 0.2; // 选举迟滞阈值
+const double HeterogeneousNodeApp::SPN_SWITCH_HYSTERESIS = 0.2; // 旧代理切换阈值
+const double HeterogeneousNodeApp::V_TH = 10.0;                 // 速度惩罚阈值 (m/s)
+const double HeterogeneousNodeApp::LAMBDA = 0.5;                // Sigmoid 陡峭系数
+const double HeterogeneousNodeApp::ALPHA = 0.5;                 // L_topo 中 mobility 权重
+const double HeterogeneousNodeApp::BETA = 0.5;                  // L_topo 中 struct 权重
+const double HeterogeneousNodeApp::GAMMA = 0.6;                 // Adhoc 结构一跳权重
+const double HeterogeneousNodeApp::SINR_MIN = 0.0;              // dB
+const double HeterogeneousNodeApp::SINR_MAX = 30.0;             // dB
+const double HeterogeneousNodeApp::DELTA_TH = 0.05;             // SPN 切换迟滞阈值
 const double HeterogeneousNodeApp::SCORE_INPUT_EMA_ALPHA = 0.22;   // 输入平滑：抑制 linkQ 小幅抖动
 const double HeterogeneousNodeApp::SCORE_OUTPUT_EMA_ALPHA = 0.35;  // 输出平滑：Hello/泛洪用分更稳
 const double HeterogeneousNodeApp::SPN_PRIMARY_SCORE_THRESHOLD = 0.45; // 主SPN得分低于此阈值才允许一次得分降级切换
@@ -1733,6 +1814,12 @@ uint32_t HeterogeneousNodeApp::s_expectedAdhocInitialMembers = 0;
 uint32_t HeterogeneousNodeApp::s_expectedDatalinkInitialMembers = 0;
 bool HeterogeneousNodeApp::s_globalFailoverUsed = false;
 bool HeterogeneousNodeApp::s_globalEnergyUsed = false;
+const std::map<HeterogeneousNodeApp::SubnetType, HeterogeneousNodeApp::WeightVector>
+HeterogeneousNodeApp::SUBNET_WEIGHTS = {
+  { HeterogeneousNodeApp::SUBNET_ADHOC,    {0.35, 0.30, 0.20, 0.15} },
+  { HeterogeneousNodeApp::SUBNET_DATALINK, {0.25, 0.25, 0.30, 0.20} },
+  { HeterogeneousNodeApp::SUBNET_LTE,      {0.30, 0.20, 0.30, 0.20} }
+};
 
 void
 HeterogeneousNodeApp::ResetSharedElectionState ()
@@ -1883,7 +1970,7 @@ HeterogeneousNodeApp::SetProtocolTunables (double energyDeltaThreshold, double s
 }
 
 void
-HeterogeneousNodeApp::SetSpnElectionTunables (double electionTimeoutSec, uint8_t heartbeatMissThreshold)
+HeterogeneousNodeApp::SetSpnElectionTunables (double electionTimeoutSec, uint8_t heartbeatMissThreshold, double deltaTh)
 {
   if (electionTimeoutSec > 0.0)
     {
@@ -1893,6 +1980,16 @@ HeterogeneousNodeApp::SetSpnElectionTunables (double electionTimeoutSec, uint8_t
     {
       m_heartbeatMissThreshold = heartbeatMissThreshold;
     }
+  if (deltaTh > 0.0)
+    {
+      m_spnDeltaThreshold = std::min (1.0, std::max (0.0, deltaTh));
+    }
+}
+
+void
+HeterogeneousNodeApp::SetStaticComputeCapability (double capability)
+{
+  m_staticComputeCapability = std::min (1.0, std::max (0.01, capability));
 }
 
 void
@@ -1955,72 +2052,33 @@ HeterogeneousNodeApp::UpdateUvMib ()
 double
 HeterogeneousNodeApp::CalculateUtilityScore ()
 {
-  // LTE：Score = w1*E + w2*Q + w3*C + w4*M（四项，值域 [0,1]）
-  // Adhoc/DataLink：Score = 0.4*电量 + 0.35*连通度 + 0.25*稳定性（稳定性= m_mobilityScore 归一化）
   const double aOut = SCORE_OUTPUT_EMA_ALPHA;
   const bool firstCall = !m_scoreFilterInit;
-  static constexpr double kMaxDegree = 6.0;
-
-  double eRef = std::max (m_initialEnergyRef, 1e-9);
-  double eNorm = std::min (1.0, std::max (0.0, m_uvMib.m_energy / eRef));
-  double qNorm = std::min (1.0, std::max (0.0, m_uvMib.m_linkQuality));
-
-  double connectivity = static_cast<double> (m_neighborScores.size ());
-  if (m_subnetType == SUBNET_LTE)
+  Ptr<MobilityModel> mob = GetNode ()->GetObject<MobilityModel> ();
+  double speedMps = 0.0;
+  if (mob)
     {
-      connectivity = std::max (connectivity, 1.0);
-    }
-  double cNorm = std::min (connectivity / kMaxDegree, 1.0);
-  double mNorm = std::min (1.0, std::max (0.0, m_uvMib.m_mobilityScore));
-
-  double rawScore = 0.0;
-
-  if (m_subnetType == SUBNET_ADHOC || m_subnetType == SUBNET_DATALINK)
-    {
-      const double w1 = 0.4, w2 = 0.35, w3 = 0.25;
-      m_lastSpnBatteryNorm = eNorm;
-      m_lastSpnConnNorm = cNorm;
-      m_lastSpnStabNorm = mNorm;
-      rawScore = w1 * eNorm + w2 * cNorm + w3 * mNorm;
-      rawScore = std::min (1.0, std::max (0.0, rawScore));
-      if (firstCall)
-        {
-          m_emaFinalScore = rawScore;
-          m_scoreFilterInit = true;
-        }
-      else
-        {
-          m_emaFinalScore = aOut * rawScore + (1.0 - aOut) * m_emaFinalScore;
-        }
-      double score = std::min (1.0, std::max (0.0, m_emaFinalScore));
-      NS_LOG_INFO ("[Election] Node " << GetNode ()->GetId ()
-                                      << " calculated Score: "
-                                      << std::fixed << std::setprecision (3) << score
-                                      << " raw=" << rawScore
-                                      << " (SPN3: En:" << eNorm << " Cn:" << cNorm << " Stab:" << mNorm
-                                      << " w=0.4,0.35,0.25)");
-      return score;
+      Vector v = mob->GetVelocity ();
+      speedMps = std::sqrt (v.x * v.x + v.y * v.y + v.z * v.z);
     }
 
-  double w1 = 0.4, w2 = 0.3, w3 = 0.2, w4 = 0.1;
-  if (m_lteIsEnb)
-    {
-      w1 = 0.4;
-      w2 = 0.35;
-      w3 = 0.15;
-      w4 = 0.1;
-    }
-  else
-    {
-      w1 = 0.3;
-      w2 = 0.35;
-      w3 = 0.15;
-      w4 = 0.2;
-    }
+  SpnCandidateInfo info;
+  info.nodeId = GetNode ()->GetId ();
+  info.subnetType = m_subnetType;
+  info.L_energy = std::min (1.0, std::max (0.0, m_uvMib.m_energy / std::max (m_initialEnergyRef, 1e-9)));
+  std::vector<uint32_t> oneHop = GetOneHopNeighbors ();
+  std::vector<uint32_t> twoHop = GetTwoHopNeighborsProxy ();
+  uint32_t clusterSize = GetSubnetClusterSize ();
+  info.L_mobility = ComputeLmobility (speedMps); // Sigmoid 速度稳定度
+  info.L_struct = ComputeLstruct (info.nodeId, m_subnetType, oneHop, twoHop, clusterSize); // 子网差异结构连通
+  info.L_topo = ComputeLtopo (info.nodeId, m_subnetType, speedMps, oneHop, twoHop, clusterSize); // 拓扑复合因子
+  info.L_link = ComputeLlink (info.nodeId, BuildNeighborSinrProxyMap ()); // SINR 线性归一化
+  info.L_comp_static = m_staticComputeCapability;
+  info.rho_queue = m_queueOccupancyRatio;
+  info.L_comp = ComputeLcomp (info.L_comp_static, info.rho_queue, &info.disqualified); // 队列满直接失格
+  info.totalScore = ComputeSpnScore (info, m_subnetType);
 
-  rawScore = w1 * eNorm + w2 * qNorm + w3 * cNorm + w4 * mNorm;
-  rawScore = std::min (1.0, std::max (0.0, rawScore));
-
+  double rawScore = std::min (1.0, std::max (0.0, info.totalScore));
   if (firstCall)
     {
       m_emaFinalScore = rawScore;
@@ -2031,15 +2089,176 @@ HeterogeneousNodeApp::CalculateUtilityScore ()
       m_emaFinalScore = aOut * rawScore + (1.0 - aOut) * m_emaFinalScore;
     }
 
+  m_lastSpnBatteryNorm = info.L_energy;
+  m_lastSpnConnNorm = info.L_topo;
+  m_lastSpnStabNorm = info.L_link;
   double score = std::min (1.0, std::max (0.0, m_emaFinalScore));
-
-  NS_LOG_INFO ("[Election] Node " << GetNode ()->GetId ()
-                                  << " calculated Score: "
-                                  << std::fixed << std::setprecision (3) << score
+  NS_LOG_INFO ("[Election] Node " << info.nodeId
+                                  << " score=" << std::fixed << std::setprecision (3) << score
                                   << " raw=" << rawScore
-                                  << " (En:" << eNorm << " Qn:" << qNorm << " Cn:" << cNorm << " Mn:" << mNorm
-                                  << " w=" << w1 << "," << w2 << "," << w3 << "," << w4 << ")");
+                                  << " E=" << info.L_energy
+                                  << " Topo=" << info.L_topo
+                                  << " Link=" << info.L_link
+                                  << " Comp=" << info.L_comp
+                                  << " qOcc=" << info.rho_queue
+                                  << " disq=" << (info.disqualified ? 1 : 0));
   return score;
+}
+
+double
+HeterogeneousNodeApp::ComputeLmobility (double speedMps) const
+{
+  // L_mobility = 1 / (1 + exp(lambda * (v - v_th)))
+  return std::min (1.0, std::max (0.0, 1.0 / (1.0 + std::exp (LAMBDA * (speedMps - V_TH)))));
+}
+
+double
+HeterogeneousNodeApp::ComputeLstruct (uint32_t, SubnetType subnetType,
+                                      const std::vector<uint32_t>& oneHopNeighbors,
+                                      const std::vector<uint32_t>& twoHopNeighbors,
+                                      uint32_t clusterSize) const
+{
+  if (clusterSize <= 1)
+    {
+      return 0.0;
+    }
+  const double n1 = static_cast<double> (oneHopNeighbors.size ());
+  if (subnetType == SUBNET_DATALINK)
+    {
+      return std::min (1.0, std::max (0.0, n1 / static_cast<double> (clusterSize - 1)));
+    }
+  if (subnetType == SUBNET_ADHOC)
+    {
+      const double n2 = static_cast<double> (twoHopNeighbors.size ());
+      const double oneHopNorm = n1 / static_cast<double> (clusterSize - 1);
+      const double twoHopNorm = n2 / static_cast<double> (clusterSize);
+      return std::min (1.0, std::max (0.0, GAMMA * oneHopNorm + (1.0 - GAMMA) * twoHopNorm));
+    }
+  return 0.0; // LTE 不使用结构项
+}
+
+double
+HeterogeneousNodeApp::ComputeLtopo (uint32_t nodeId, SubnetType subnetType, double speedMps,
+                                    const std::vector<uint32_t>& oneHopNeighbors,
+                                    const std::vector<uint32_t>& twoHopNeighbors,
+                                    uint32_t clusterSize) const
+{
+  const double lMob = ComputeLmobility (speedMps);
+  if (subnetType == SUBNET_LTE)
+    {
+      return lMob; // LTE: L_topo = L_mobility
+    }
+  const double lStruct = ComputeLstruct (nodeId, subnetType, oneHopNeighbors, twoHopNeighbors, clusterSize);
+  return std::min (1.0, std::max (0.0, ALPHA * lMob + BETA * lStruct));
+}
+
+double
+HeterogeneousNodeApp::ComputeLlink (uint32_t, const std::map<uint32_t, double>& neighborSinrMap) const
+{
+  if (neighborSinrMap.empty ())
+    {
+      return std::min (1.0, std::max (0.0, m_uvMib.m_linkQuality));
+    }
+  double sum = 0.0;
+  for (const auto& kv : neighborSinrMap)
+    {
+      double norm = (kv.second - SINR_MIN) / std::max (1e-9, (SINR_MAX - SINR_MIN));
+      sum += std::min (1.0, std::max (0.0, norm));
+    }
+  return std::min (1.0, std::max (0.0, sum / static_cast<double> (neighborSinrMap.size ())));
+}
+
+double
+HeterogeneousNodeApp::ComputeLcomp (double staticCapability, double queueOccupancy, bool* disqualified) const
+{
+  const double q = std::min (1.0, std::max (0.0, queueOccupancy));
+  if (disqualified)
+    {
+      *disqualified = (q >= 1.0);
+    }
+  if (q >= 1.0)
+    {
+      return 0.0;
+    }
+  const double cappedStatic = std::min (1.0, std::max (0.01, staticCapability));
+  return std::min (1.0, std::max (0.0, cappedStatic * (1.0 - q)));
+}
+
+double
+HeterogeneousNodeApp::ComputeSpnScore (const SpnCandidateInfo& info, SubnetType subnetType) const
+{
+  auto it = SUBNET_WEIGHTS.find (subnetType);
+  WeightVector w = (it == SUBNET_WEIGHTS.end ()) ? WeightVector{0.35, 0.30, 0.20, 0.15} : it->second;
+  return w.wEnergy * info.L_energy + w.wTopo * info.L_topo + w.wLink * info.L_link + w.wComp * info.L_comp;
+}
+
+std::vector<uint32_t>
+HeterogeneousNodeApp::GetOneHopNeighbors () const
+{
+  std::vector<uint32_t> oneHop;
+  oneHop.reserve (m_neighborAddrs.size ());
+  for (const auto& kv : m_neighborAddrs)
+    {
+      oneHop.push_back (kv.first);
+    }
+  return oneHop;
+}
+
+std::vector<uint32_t>
+HeterogeneousNodeApp::GetTwoHopNeighborsProxy () const
+{
+  std::set<uint32_t> oneHopSet;
+  std::set<uint32_t> twoHopSet;
+  const uint32_t selfId = GetNode ()->GetId ();
+  for (const auto& kv : m_neighborAddrs)
+    {
+      oneHopSet.insert (kv.first);
+    }
+  for (uint32_t nb : oneHopSet)
+    {
+      Ptr<HeterogeneousNodeApp> app = FindHetAppOnNode (nb, m_subnetType);
+      if (!app)
+        {
+          continue;
+        }
+      for (const auto& n2 : app->m_neighborAddrs)
+        {
+          if (n2.first == selfId || oneHopSet.count (n2.first) != 0u)
+            {
+              continue;
+            }
+          twoHopSet.insert (n2.first);
+        }
+    }
+  return std::vector<uint32_t> (twoHopSet.begin (), twoHopSet.end ());
+}
+
+uint32_t
+HeterogeneousNodeApp::GetSubnetClusterSize () const
+{
+  uint32_t total = 0;
+  for (uint32_t i = 0; i < NodeList::GetNNodes (); ++i)
+    {
+      Ptr<HeterogeneousNodeApp> app = FindHetAppOnNode (i, m_subnetType);
+      if (app && app->m_running)
+        {
+          total++;
+        }
+    }
+  return std::max (1u, total);
+}
+
+std::map<uint32_t, double>
+HeterogeneousNodeApp::BuildNeighborSinrProxyMap () const
+{
+  std::map<uint32_t, double> out;
+  // 若缺少物理层 SINR 监控，则使用已有 linkQuality 作为代理线性映射到 [0,30] dB。
+  for (const auto& kv : m_neighborAddrs)
+    {
+      double sinrProxy = std::min (SINR_MAX, std::max (SINR_MIN, m_uvMib.m_linkQuality * SINR_MAX));
+      out[kv.first] = sinrProxy;
+    }
+  return out;
 }
 
 void
@@ -2099,6 +2318,7 @@ HeterogeneousNodeApp::HandleHello (Ptr<Socket> socket)
               m_currentPrimaryId = primaryId;
               m_lastPrimaryHeartbeatTs = Simulator::Now ().GetSeconds ();
               m_missedHeartbeats = 0;
+              m_backupHeartbeatGraceUntilTs = -1.0;
             }
           continue;
         }
@@ -2211,6 +2431,24 @@ HeterogeneousNodeApp::SendHeartbeatSync ()
       Ptr<Packet> pkt = Create<Packet> (buf, len);
       InetSocketAddress dst = InetSocketAddress (Ipv4Address ("255.255.255.255"), m_helloPort);
       m_helloSocket->SendTo (pkt, 0, dst);
+      uint32_t backupId = m_committedBackupId;
+      if (backupId != 0 && backupId != selfId)
+        {
+          auto itB = m_neighborAddrs.find (backupId);
+          if (itB != m_neighborAddrs.end ())
+            {
+              Ptr<Packet> pktU = Create<Packet> (buf, len);
+              m_helloSocket->SendTo (pktU, 0, InetSocketAddress (itB->second, m_helloPort));
+            }
+        }
+      m_heartbeatSendSeq++;
+      uint32_t tgt = m_committedBackupId;
+      if (tgt == 0 || tgt == selfId)
+        {
+          tgt = m_committedPrimaryId;
+        }
+      NMS_LOG_INFO (selfId, "HEARTBEAT_SEND",
+                    "target=" + std::to_string (tgt) + " seq=" + std::to_string (m_heartbeatSendSeq));
     }
   m_heartbeatEvent = Simulator::Schedule (Seconds (HEARTBEAT_SEC), &HeterogeneousNodeApp::SendHeartbeatSync, this);
 }
@@ -2226,13 +2464,18 @@ HeterogeneousNodeApp::CheckPrimaryHeartbeat ()
   if (m_isBackupSpn && m_currentPrimaryId != GetNode ()->GetId ())
     {
       double now = Simulator::Now ().GetSeconds ();
+      if (m_backupHeartbeatGraceUntilTs >= 0.0 && now < m_backupHeartbeatGraceUntilTs)
+        {
+          m_heartbeatEvent = Simulator::Schedule (Seconds (HEARTBEAT_SEC), &HeterogeneousNodeApp::CheckPrimaryHeartbeat, this);
+          return;
+        }
       // 略大于 HEARTBEAT_SEC 的判定裕量，避免调度抖动导致误计丢心跳
-      const double hbGrace = HEARTBEAT_SEC * 1.25;
+      const double hbGrace = HEARTBEAT_SEC * 2.5;
       if (m_lastPrimaryHeartbeatTs > 0.0 && (now - m_lastPrimaryHeartbeatTs) > hbGrace)
         {
           m_missedHeartbeats++;
           m_lastPrimaryHeartbeatTs = now; // 防止一次超时被重复快速累计
-      if (m_missedHeartbeats >= m_heartbeatMissThreshold)
+          if (m_missedHeartbeats >= m_heartbeatMissThreshold)
             {
               m_failoverPending = true;
               m_failoverStartTs = now;
@@ -2312,12 +2555,73 @@ HeterogeneousNodeApp::SpnMergeScoresIntoShared (double myScore)
 }
 
 void
+HeterogeneousNodeApp::ResyncSpnHeartbeatTimerFromRoleTransition (bool oldIsSpn, bool oldBackup)
+{
+  if ((m_subnetType != SUBNET_ADHOC && m_subnetType != SUBNET_DATALINK) || !m_running)
+    {
+      return;
+    }
+  const bool nowPrimary = m_isSpn;
+  const bool nowBackup = m_isBackupSpn;
+  if (oldIsSpn == nowPrimary && oldBackup == nowBackup)
+    {
+      return;
+    }
+  uint32_t selfId = GetNode ()->GetId ();
+  if (m_heartbeatEvent.IsRunning ())
+    {
+      Simulator::Cancel (m_heartbeatEvent);
+    }
+  if (nowPrimary)
+    {
+      if (oldBackup && nowPrimary)
+        {
+          NMS_LOG_INFO (selfId, "TAKEOVER_COMPLETE",
+                        "new_primary=" + std::to_string (selfId) + " subnet=" +
+                        std::to_string (static_cast<uint32_t> (m_subnetType)));
+        }
+      if (!m_flushEvent.IsRunning ())
+        {
+          m_flushEvent = Simulator::Schedule (m_aggregateInterval,
+                                              &HeterogeneousNodeApp::FlushAggregatedToGmc, this);
+        }
+      if (m_failoverPending)
+        {
+          double healSec = Simulator::Now ().GetSeconds () - m_failoverStartTs;
+          NMS_LOG_INFO (selfId, "SELF_HEAL_TIME", "takeover completed in " + std::to_string (healSec) + "s");
+          m_failoverPending = false;
+        }
+      Simulator::ScheduleNow (&HeterogeneousNodeApp::SendHeartbeatSync, this);
+    }
+  else if (nowBackup)
+    {
+      NMS_LOG_INFO (selfId, "SPN_ELECT", "elected as backup SPN");
+      m_missedHeartbeats = 0;
+      m_heartbeatEvent = Simulator::Schedule (Seconds (HEARTBEAT_SEC),
+                                              &HeterogeneousNodeApp::CheckPrimaryHeartbeat, this);
+    }
+  else if (oldIsSpn && !nowPrimary)
+    {
+      NMS_LOG_INFO (selfId, "SPN_SWITCH", "lost primary SPN role");
+      m_heartbeatEvent = Simulator::Schedule (Seconds (HEARTBEAT_SEC),
+                                              &HeterogeneousNodeApp::CheckPrimaryHeartbeat, this);
+    }
+  else
+    {
+      m_heartbeatEvent = Simulator::Schedule (Seconds (HEARTBEAT_SEC),
+                                              &HeterogeneousNodeApp::CheckPrimaryHeartbeat, this);
+    }
+}
+
+void
 HeterogeneousNodeApp::ApplyLocalRoleFromShared ()
 {
   if (m_subnetType != SUBNET_ADHOC && m_subnetType != SUBNET_DATALINK)
     {
       return;
     }
+  const bool oldIsSpn = m_isSpn;
+  const bool oldBackup = m_isBackupSpn;
   uint32_t selfId = GetNode ()->GetId ();
   SharedSpnState& shared = s_sharedSpnState[static_cast<uint8_t> (m_subnetType)];
   m_initialSpnLocked = shared.initialized;
@@ -2334,6 +2638,21 @@ HeterogeneousNodeApp::ApplyLocalRoleFromShared ()
   m_currentPrimaryId = spnNodeId;
   m_isSpn = (spnNodeId == selfId);
   m_isBackupSpn = (backupNodeId == selfId && !m_isSpn);
+  if (m_committedPrimaryId != m_lastSyncedCommittedPrimaryId)
+    {
+      if (m_isBackupSpn && m_lastSyncedCommittedPrimaryId != 0)
+        {
+          m_missedHeartbeats = 0;
+          m_lastPrimaryHeartbeatTs = Simulator::Now ().GetSeconds ();
+          m_backupHeartbeatGraceUntilTs =
+              Simulator::Now ().GetSeconds () + static_cast<double> (m_heartbeatMissThreshold) * HEARTBEAT_SEC + HEARTBEAT_SEC;
+        }
+      m_lastSyncedCommittedPrimaryId = m_committedPrimaryId;
+    }
+  if (oldIsSpn != m_isSpn || oldBackup != m_isBackupSpn)
+    {
+      ResyncSpnHeartbeatTimerFromRoleTransition (oldIsSpn, oldBackup);
+    }
   if (!m_isSpn && spnNodeId != selfId)
     {
       auto it = m_neighborAddrs.find (spnNodeId);
@@ -2449,13 +2768,35 @@ HeterogeneousNodeApp::RunFullElection (const std::string& electReason)
   SpnMergeScoresIntoShared (myScore);
 
   SharedSpnState& shared = s_sharedSpnState[static_cast<uint8_t> (m_subnetType)];
+  const uint32_t electPrevPrimary = shared.primaryId;
 
   std::vector<std::pair<double, uint32_t>> candidates;
+  bool currentPrimaryDisqualified = false;
+  double currentPrimaryScore = -1.0;
   for (const auto& kv : shared.scoreByNode)
     {
       double age = now - shared.scoreTimeByNode[kv.first];
-      if (age <= m_spnScoreStaleSec)
-        candidates.push_back (std::make_pair (kv.second, kv.first));
+      if (age > m_spnScoreStaleSec)
+        {
+          continue;
+        }
+      Ptr<HeterogeneousNodeApp> candApp = FindHetAppOnNode (kv.first, m_subnetType);
+      bool disqByQueue = (candApp && candApp->m_queueOccupancyRatio >= 1.0);
+      if (shared.initialized && kv.first == shared.primaryId)
+        {
+          if (!candApp || !candApp->m_running || disqByQueue)
+            {
+              currentPrimaryDisqualified = true;
+            }
+          else
+            {
+              currentPrimaryScore = kv.second;
+            }
+        }
+      if (!disqByQueue)
+        {
+          candidates.push_back (std::make_pair (kv.second, kv.first));
+        }
     }
   if (candidates.empty ())
     candidates.push_back (std::make_pair (myScore, selfId));
@@ -2495,12 +2836,49 @@ HeterogeneousNodeApp::RunFullElection (const std::string& electReason)
     }
   else
     {
-      if (newPrimary != shared.primaryId || newBackup != shared.backupId)
+      if (newPrimary != shared.primaryId)
+        {
+          if (!currentPrimaryDisqualified)
+            {
+              // 迟滞：仅当候选分数显著高于当前主 SPN 才切换
+              if (currentPrimaryScore < 0.0)
+                {
+                  auto itCurr = shared.scoreByNode.find (shared.primaryId);
+                  if (itCurr != shared.scoreByNode.end ())
+                    {
+                      currentPrimaryScore = itCurr->second;
+                    }
+                }
+              if (currentPrimaryScore >= 0.0 && (primaryScoreVal - currentPrimaryScore) <= m_spnDeltaThreshold)
+                {
+                  newPrimary = shared.primaryId;
+                  primaryScoreVal = currentPrimaryScore;
+                  for (const auto& c : candidates)
+                    {
+                      if (c.second != newPrimary)
+                        {
+                          newBackup = c.second;
+                          backupScoreVal = c.first;
+                          break;
+                        }
+                    }
+                }
+            }
+        }
+
+      if (newPrimary != shared.primaryId || newBackup != shared.backupId || currentPrimaryDisqualified)
         {
           shared.primaryId = newPrimary;
           shared.backupId = newBackup;
           stateChanged = true;
-          changeReason = electReason.empty () ? "stable_full_reselect" : electReason;
+          if (currentPrimaryDisqualified)
+            {
+              changeReason = electReason.empty () ? "forced_switch_primary_disqualified" : electReason;
+            }
+          else
+            {
+              changeReason = electReason.empty () ? "stable_full_reselect" : electReason;
+            }
         }
     }
 
@@ -2541,6 +2919,14 @@ HeterogeneousNodeApp::RunFullElection (const std::string& electReason)
   bool wasBackup = m_isBackupSpn;
   m_isSpn = (spnNodeId == selfId);
   m_isBackupSpn = (backupNodeId == selfId && !m_isSpn);
+  if (m_isBackupSpn && electPrevPrimary != 0 && spnNodeId != electPrevPrimary)
+    {
+      m_missedHeartbeats = 0;
+      m_lastPrimaryHeartbeatTs = Simulator::Now ().GetSeconds ();
+      m_backupHeartbeatGraceUntilTs =
+          Simulator::Now ().GetSeconds () + static_cast<double> (m_heartbeatMissThreshold) * HEARTBEAT_SEC + HEARTBEAT_SEC;
+    }
+  m_lastSyncedCommittedPrimaryId = m_committedPrimaryId;
 
   // 普通节点：上报目标对应当前「有效」主 SPN；无邻居地址时再尝试备 SPN
   if (!m_isSpn && spnNodeId != selfId)
@@ -2561,14 +2947,18 @@ HeterogeneousNodeApp::RunFullElection (const std::string& electReason)
   if (m_isSpn && !wasSpn)
     {
       if (wasBackup)
-        NMS_LOG_INFO (selfId, "SPN_TAKEOVER", std::string ("Node ") + std::to_string (selfId) + " takes over as primary SPN");
+        {
+          NMS_LOG_INFO (selfId, "SPN_TAKEOVER", std::string ("Node ") + std::to_string (selfId) + " takes over as primary SPN");
+          NMS_LOG_INFO (selfId, "TAKEOVER_COMPLETE",
+                        "new_primary=" + std::to_string (selfId) + " subnet=" +
+                        std::to_string (static_cast<uint32_t> (m_subnetType)));
+        }
       if (!m_flushEvent.IsRunning ())
         m_flushEvent = Simulator::Schedule (m_aggregateInterval,
                                             &HeterogeneousNodeApp::FlushAggregatedToGmc, this);
       if (m_heartbeatEvent.IsRunning ())
         Simulator::Cancel (m_heartbeatEvent);
-      m_heartbeatEvent = Simulator::Schedule (Seconds (HEARTBEAT_SEC),
-                                              &HeterogeneousNodeApp::SendHeartbeatSync, this);
+      Simulator::ScheduleNow (&HeterogeneousNodeApp::SendHeartbeatSync, this);
       // SPN_ANNOUNCE / Score 泛洪见下方 stateChanged && selfId==newPrimary，避免重复
       if (m_failoverPending)
         {
@@ -3679,8 +4069,8 @@ HeterogeneousNodeApp::BuildHnmpFrame (uint8_t frameType, uint8_t qos, uint8_t ds
   h.destId = dstId;
   h.seq = m_hnmpSeq++;
   h.payloadLen = static_cast<uint8_t> (std::min (tlvLen, 255u));
-  bool compact3B = (m_subnetType == SUBNET_DATALINK);
-  return Hnmp::EncodeFrame (out, outSize, h, tlv, h.payloadLen, compact3B);
+  // 与 Adhoc 统一为完整 6 字节 HNMP 头（仿真层仍走 UDP/IP；真实数据链可在论文中描述为逻辑等效载荷）
+  return Hnmp::EncodeFrame (out, outSize, h, tlv, h.payloadLen, false);
 }
 
 bool
@@ -3689,9 +4079,24 @@ HeterogeneousNodeApp::ParseHnmpFrame (const uint8_t* in, uint32_t inLen,
 {
   if (!in || inLen == 0 || !outPayload || !outPayloadLen) return false;
   Hnmp::Header h = {};
-  bool compact3B = (m_subnetType == SUBNET_DATALINK);
-  if (Hnmp::DecodeFrame (in, inLen, compact3B, &h, outPayload, outPayloadLen))
-    return true;
+  if (inLen >= 6)
+    {
+      uint8_t pLen = in[5];
+      if (inLen == 6u + pLen)
+        {
+          if (Hnmp::DecodeFrame (in, inLen, false, &h, outPayload, outPayloadLen))
+            return true;
+        }
+    }
+  if (inLen >= 3)
+    {
+      uint8_t pLen = in[2];
+      if (inLen == 3u + pLen)
+        {
+          if (Hnmp::DecodeFrame (in, inLen, true, &h, outPayload, outPayloadLen))
+            return true;
+        }
+    }
   // 兼容旧版：历史报文直接是 TLV，无 HNMP 头
   *outPayload = in;
   *outPayloadLen = inLen;
@@ -3815,11 +4220,21 @@ HeterogeneousNodeApp::SendPacket ()
   if (!shouldSend)
     {
       m_suppressedScheduleDecisions++;
+      // 轻量队列占用监控：持续抑制视作发送队列积压增加
+      if (decisionReason == "IN_SUPPRESS_WINDOW_SKIP")
+        {
+          m_queueOccupancyRatio = std::min (1.0, m_queueOccupancyRatio + 0.08);
+        }
+      else
+        {
+          m_queueOccupancyRatio = std::min (1.0, m_queueOccupancyRatio + 0.03);
+        }
       LogDecision ("SKIP", decisionReason, stateDelta, now);
       ScheduleNextTx ();
       return;
     }
   m_triggeredScheduleDecisions++;
+  m_queueOccupancyRatio = std::max (0.0, m_queueOccupancyRatio - 0.20);
   LogDecision ("TRIGGER", decisionReason, stateDelta, now);
 
   // 5) 迟滞切换：切换阈值 0.15，降低微小波动导致的切换
@@ -4040,6 +4455,7 @@ HeterogeneousNodeApp::SendPacket ()
     }
   if (sentThisRound && prevReportTs >= 0.0)
     {
+      m_queueOccupancyRatio = std::max (0.0, m_queueOccupancyRatio - 0.10);
       double interval = now - prevReportTs;
       if (interval > 0.0 && interval < 1e8)
         {
@@ -4222,6 +4638,19 @@ MapBusinessPriorityToIpTos (uint8_t businessPriority)
 class HeterogeneousNmsFramework
 {
 public:
+  enum RoutingMode
+  {
+    ROUTING_AUTO = 0,
+    ROUTING_AODV,
+    ROUTING_OLSR
+  };
+  enum RouteAdaptLevel
+  {
+    ADAPT_AUTO = 0,
+    ADAPT_STABLE,
+    ADAPT_DEGRADED,
+    ADAPT_CRITICAL
+  };
   /// WiFi Ad-hoc 子网拓扑类型（解耦拓扑形状与 OLSR/移动性）
   /// 星型：指定中心节点，其余仅与中心直连；树型：按节点 ID 层级；网状：全联通
   enum AdhocTopologyType
@@ -4252,6 +4681,11 @@ public:
   void SetStateSuppressWindow (double v) { if (v >= 0.0) m_stateSuppressWindowSec = v; }
   void SetAggregateIntervalSec (double v) { if (v > 0.0) m_aggregateIntervalSec = v; }
   void SetScenarioMode (const std::string& mode) { m_scenarioMode = mode; }
+  void SetRoutingMode (const std::string& mode);
+  void SetRouteAdaptLevel (const std::string& level);
+  void SetRouteAdaptRuntime (bool enable) { m_routeAdaptRuntimeEnable = enable; }
+  void SetRouteAdaptRuntimeWindowSec (double v) { if (v > 0.1) m_routeAdaptRuntimeWindowSec = v; }
+  void SetRouteAdaptRuntimeCooldownSec (double v) { if (v > 0.1) m_routeAdaptRuntimeCooldownSec = v; }
   /// InstallApplications 前：由 config.json 注入 SPN 选举超时与心跳丢失阈值（默认与构造函数一致；scenario_config 仍可在 Run 内覆盖）
   void SetFrameworkSpnElectionTunables (double electionTimeoutSec, uint8_t heartbeatMissThreshold);
 
@@ -4312,6 +4746,13 @@ private:
   std::vector<uint32_t> GetOlsrPath (uint32_t srcNodeId, uint32_t dstNodeId) const;
   /// 根据节点 ID 获取 Ptr<Node>（遍历 NodeList）
   static Ptr<Node> GetNodeById (uint32_t nodeId);
+  RoutingMode DecideRoutingModeAuto (const ScenarioConfig* sc) const;
+  static std::string RoutingModeToString (RoutingMode mode);
+  RouteAdaptLevel DecideRouteAdaptLevelAuto (const ScenarioConfig* sc) const;
+  static std::string RouteAdaptLevelToString (RouteAdaptLevel level);
+  void ApplyAdhocRoutingAdaptiveParams ();
+  void ApplyOlsrRuntimeParamsToAdhoc (double helloSec, double tcSec);
+  void MaybeUpdateRuntimeRouteAdapt (double avgLossPct, double avgDelayMs, uint32_t zeroThroughputFlows, double nowSec);
 
 private:
   // 全局管理中心
@@ -4371,6 +4812,22 @@ private:
   double              m_stateSuppressWindowSec; ///< 状态抑制窗口（秒）
   double              m_aggregateIntervalSec; ///< SPN 聚合上报周期（秒）
   std::string         m_scenarioMode;    ///< normal|thesis30|compare-baseline|compare-hnmp
+  RoutingMode         m_routingModeConfigured; ///< 命令行/上层指定的路由模式（auto/aodv/olsr）
+  RoutingMode         m_routingModeEffective;  ///< 本轮仿真最终生效的路由模式
+  RouteAdaptLevel     m_routeAdaptConfigured;  ///< 路由参数自适应档位（auto/stable/degraded/critical）
+  RouteAdaptLevel     m_routeAdaptEffective;   ///< 本轮仿真生效档位
+  double              m_adhocOlsrHelloSec;     ///< Adhoc OLSR HelloInterval
+  double              m_adhocOlsrTcSec;        ///< Adhoc OLSR TcInterval
+  double              m_adhocAodvHelloSec;     ///< Adhoc AODV HelloInterval
+  double              m_adhocAodvActiveRouteTimeoutSec; ///< Adhoc AODV ActiveRouteTimeout
+  uint32_t            m_adhocAodvAllowedHelloLoss; ///< Adhoc AODV AllowedHelloLoss
+  bool                m_routeAdaptRuntimeEnable; ///< 运行时路由参数调优开关（默认关闭，不影响既有行为）
+  double              m_routeAdaptRuntimeWindowSec; ///< 运行时评估窗口（秒）
+  double              m_routeAdaptRuntimeCooldownSec; ///< 运行时档位切换冷却时间（秒）
+  double              m_routeAdaptRuntimeLastSwitchTs; ///< 最近一次切换时刻（秒）
+  double              m_routeAdaptRuntimeLastEvalTs; ///< 最近一次运行时评估时刻（秒）
+  uint32_t            m_routeAdaptUpgradeVotes; ///< 升档确认计数
+  uint32_t            m_routeAdaptDowngradeVotes; ///< 降档确认计数
   uint32_t            m_defaultAdhocNodes; ///< 默认 Adhoc 节点数（无 join_config）
   uint32_t            m_defaultDataLinkNodes; ///< 默认 DataLink 节点数（无 join_config）
   uint32_t            m_defaultLteUeNodes; ///< 默认 LTE UE 节点数（无 join_config）
@@ -4433,13 +4890,29 @@ HeterogeneousNmsFramework::HeterogeneousNmsFramework ()
     m_spnDatalink (0),
     m_simTimeSeconds (90.0),
     m_adhocTopology (ADHOC_TOPOLOGY_MESH),
-    m_enablePacketParse (false),
+    m_enablePacketParse (true),
     m_enablePcap (false),
     m_useDualChannel (false),
     m_energyDeltaThreshold (0.15),
     m_stateSuppressWindowSec (15.0),
     m_aggregateIntervalSec (2.0),
     m_scenarioMode ("normal"),
+    m_routingModeConfigured (ROUTING_AUTO),
+    m_routingModeEffective (ROUTING_OLSR),
+    m_routeAdaptConfigured (ADAPT_AUTO),
+    m_routeAdaptEffective (ADAPT_STABLE),
+    m_adhocOlsrHelloSec (0.5),
+    m_adhocOlsrTcSec (1.0),
+    m_adhocAodvHelloSec (0.5),
+    m_adhocAodvActiveRouteTimeoutSec (4.0),
+    m_adhocAodvAllowedHelloLoss (3),
+    m_routeAdaptRuntimeEnable (false),
+    m_routeAdaptRuntimeWindowSec (5.0),
+    m_routeAdaptRuntimeCooldownSec (20.0),
+    m_routeAdaptRuntimeLastSwitchTs (-1.0),
+    m_routeAdaptRuntimeLastEvalTs (-1.0),
+    m_routeAdaptUpgradeVotes (0),
+    m_routeAdaptDowngradeVotes (0),
     m_defaultAdhocNodes (5),
     m_defaultDataLinkNodes (4),
     m_defaultLteUeNodes (5),
@@ -4457,6 +4930,278 @@ HeterogeneousNmsFramework::HeterogeneousNmsFramework ()
 
 HeterogeneousNmsFramework::~HeterogeneousNmsFramework ()
 {
+}
+
+void
+HeterogeneousNmsFramework::SetRoutingMode (const std::string& mode)
+{
+  if (mode == "aodv" || mode == "AODV")
+    {
+      m_routingModeConfigured = ROUTING_AODV;
+      return;
+    }
+  if (mode == "olsr" || mode == "OLSR")
+    {
+      m_routingModeConfigured = ROUTING_OLSR;
+      return;
+    }
+  m_routingModeConfigured = ROUTING_AUTO;
+}
+
+void
+HeterogeneousNmsFramework::SetRouteAdaptLevel (const std::string& level)
+{
+  if (level == "stable" || level == "STABLE")
+    {
+      m_routeAdaptConfigured = ADAPT_STABLE;
+      return;
+    }
+  if (level == "degraded" || level == "DEGRADED")
+    {
+      m_routeAdaptConfigured = ADAPT_DEGRADED;
+      return;
+    }
+  if (level == "critical" || level == "CRITICAL")
+    {
+      m_routeAdaptConfigured = ADAPT_CRITICAL;
+      return;
+    }
+  m_routeAdaptConfigured = ADAPT_AUTO;
+}
+
+std::string
+HeterogeneousNmsFramework::RoutingModeToString (RoutingMode mode)
+{
+  if (mode == ROUTING_AODV)
+    {
+      return "aodv";
+    }
+  if (mode == ROUTING_OLSR)
+    {
+      return "olsr";
+    }
+  return "auto";
+}
+
+std::string
+HeterogeneousNmsFramework::RouteAdaptLevelToString (RouteAdaptLevel level)
+{
+  if (level == ADAPT_STABLE)
+    {
+      return "stable";
+    }
+  if (level == ADAPT_DEGRADED)
+    {
+      return "degraded";
+    }
+  if (level == ADAPT_CRITICAL)
+    {
+      return "critical";
+    }
+  return "auto";
+}
+
+HeterogeneousNmsFramework::RoutingMode
+HeterogeneousNmsFramework::DecideRoutingModeAuto (const ScenarioConfig* sc) const
+{
+  // 管理策略（方案1）：每轮仿真启动前一次性决策，不做运行时热切换
+  // 经验规则：持续并发业务/高负载场景更偏向 OLSR；轻载/基线场景偏向 AODV 以降低控制开销。
+  if (m_scenarioMode == "compare-baseline")
+    {
+      return ROUTING_AODV;
+    }
+  if (m_scenarioMode == "compare-hnmp" || m_scenarioMode == "thesis30")
+    {
+      return ROUTING_OLSR;
+    }
+  if (sc && !sc->businessFlows.empty ())
+    {
+      double totalOfferedMbps = 0.0;
+      auto parseRateMbps = [] (const std::string& s) -> double {
+        if (s.empty ())
+          {
+            return 0.0;
+          }
+        std::string lower = s;
+        std::transform (lower.begin (), lower.end (), lower.begin (), ::tolower);
+        char* endp = nullptr;
+        double val = std::strtod (lower.c_str (), &endp);
+        if (!std::isfinite (val) || endp == lower.c_str ())
+          {
+            return 0.0;
+          }
+        std::string unit = lower.substr (static_cast<size_t> (endp - lower.c_str ()));
+        if (unit.find ("gbps") != std::string::npos)
+          {
+            return val * 1000.0;
+          }
+        if (unit.find ("kbps") != std::string::npos)
+          {
+            return val / 1000.0;
+          }
+        return val;
+      };
+      for (const auto& bf : sc->businessFlows)
+        {
+          totalOfferedMbps += parseRateMbps (bf.dataRate);
+        }
+      if (sc->businessFlows.size () >= 4 || totalOfferedMbps >= 3.0)
+        {
+          return ROUTING_OLSR;
+        }
+    }
+  return ROUTING_AODV;
+}
+
+HeterogeneousNmsFramework::RouteAdaptLevel
+HeterogeneousNmsFramework::DecideRouteAdaptLevelAuto (const ScenarioConfig* sc) const
+{
+  if (m_scenarioMode == "thesis30")
+    {
+      return ADAPT_CRITICAL;
+    }
+  if (m_scenarioMode == "compare-hnmp")
+    {
+      return ADAPT_DEGRADED;
+    }
+  if (sc && !sc->events.empty ())
+    {
+      if (sc->events.size () >= 3)
+        {
+          return ADAPT_CRITICAL;
+        }
+      return ADAPT_DEGRADED;
+    }
+  return ADAPT_STABLE;
+}
+
+void
+HeterogeneousNmsFramework::ApplyAdhocRoutingAdaptiveParams ()
+{
+  if (m_routeAdaptEffective == ADAPT_CRITICAL)
+    {
+      m_adhocOlsrHelloSec = 0.25;
+      m_adhocOlsrTcSec = 0.5;
+      m_adhocAodvHelloSec = 0.25;
+      m_adhocAodvActiveRouteTimeoutSec = 3.0;
+      m_adhocAodvAllowedHelloLoss = 2;
+      return;
+    }
+  if (m_routeAdaptEffective == ADAPT_DEGRADED)
+    {
+      m_adhocOlsrHelloSec = 0.5;
+      m_adhocOlsrTcSec = 1.0;
+      m_adhocAodvHelloSec = 0.5;
+      m_adhocAodvActiveRouteTimeoutSec = 4.0;
+      m_adhocAodvAllowedHelloLoss = 3;
+      return;
+    }
+  m_adhocOlsrHelloSec = 1.0;
+  m_adhocOlsrTcSec = 2.0;
+  m_adhocAodvHelloSec = 1.0;
+  m_adhocAodvActiveRouteTimeoutSec = 6.0;
+  m_adhocAodvAllowedHelloLoss = 4;
+}
+
+void
+HeterogeneousNmsFramework::ApplyOlsrRuntimeParamsToAdhoc (double helloSec, double tcSec)
+{
+  for (uint32_t i = 0; i < m_adhocNodes.GetN (); ++i)
+    {
+      Ptr<Node> n = m_adhocNodes.Get (i);
+      Ptr<Ipv4> ipv4 = n->GetObject<Ipv4> ();
+      if (!ipv4)
+        {
+          continue;
+        }
+      Ptr<Ipv4ListRouting> list = DynamicCast<Ipv4ListRouting> (ipv4->GetRoutingProtocol ());
+      if (!list)
+        {
+          continue;
+        }
+      for (uint32_t idx = 0; idx < list->GetNRoutingProtocols (); ++idx)
+        {
+          int16_t pri = 0;
+          Ptr<Ipv4RoutingProtocol> rp = list->GetRoutingProtocol (idx, pri);
+          Ptr<olsr::RoutingProtocol> olsrRp = DynamicCast<olsr::RoutingProtocol> (rp);
+          if (!olsrRp)
+            {
+              continue;
+            }
+          olsrRp->SetAttribute ("HelloInterval", TimeValue (Seconds (helloSec)));
+          olsrRp->SetAttribute ("TcInterval", TimeValue (Seconds (tcSec)));
+          olsrRp->SetAttribute ("MidInterval", TimeValue (Seconds (std::max (1.0, tcSec * 2.0))));
+          olsrRp->SetAttribute ("HnaInterval", TimeValue (Seconds (std::max (1.0, tcSec * 2.0))));
+        }
+    }
+}
+
+void
+HeterogeneousNmsFramework::MaybeUpdateRuntimeRouteAdapt (double avgLossPct,
+                                                         double avgDelayMs,
+                                                         uint32_t zeroThroughputFlows,
+                                                         double nowSec)
+{
+  if (!m_routeAdaptRuntimeEnable || m_routingModeEffective != ROUTING_OLSR)
+    {
+      return;
+    }
+  if (m_routeAdaptRuntimeLastSwitchTs >= 0.0 &&
+      nowSec - m_routeAdaptRuntimeLastSwitchTs < m_routeAdaptRuntimeCooldownSec)
+    {
+      return;
+    }
+  RouteAdaptLevel target = m_routeAdaptEffective;
+  if (zeroThroughputFlows >= 2 || avgLossPct >= 5.0)
+    {
+      target = ADAPT_CRITICAL;
+    }
+  else if (zeroThroughputFlows >= 1 || avgLossPct >= 1.5 || avgDelayMs >= 25.0)
+    {
+      target = ADAPT_DEGRADED;
+    }
+  else
+    {
+      target = ADAPT_STABLE;
+    }
+
+  if (target > m_routeAdaptEffective)
+    {
+      m_routeAdaptUpgradeVotes++;
+      m_routeAdaptDowngradeVotes = 0;
+      if (m_routeAdaptUpgradeVotes < 2)
+        {
+          return;
+        }
+    }
+  else if (target < m_routeAdaptEffective)
+    {
+      m_routeAdaptDowngradeVotes++;
+      m_routeAdaptUpgradeVotes = 0;
+      if (m_routeAdaptDowngradeVotes < 3)
+        {
+          return;
+        }
+    }
+  else
+    {
+      m_routeAdaptUpgradeVotes = 0;
+      m_routeAdaptDowngradeVotes = 0;
+      return;
+    }
+
+  RouteAdaptLevel oldLevel = m_routeAdaptEffective;
+  m_routeAdaptEffective = target;
+  ApplyAdhocRoutingAdaptiveParams ();
+  ApplyOlsrRuntimeParamsToAdhoc (m_adhocOlsrHelloSec, m_adhocOlsrTcSec);
+  m_routeAdaptRuntimeLastSwitchTs = nowSec;
+  m_routeAdaptUpgradeVotes = 0;
+  m_routeAdaptDowngradeVotes = 0;
+  NmsLog ("INFO", 0, "ROUTE_ADAPT_RUNTIME_APPLY",
+          "old=" + RouteAdaptLevelToString (oldLevel) +
+          " new=" + RouteAdaptLevelToString (m_routeAdaptEffective) +
+          " olsr_hello=" + std::to_string (m_adhocOlsrHelloSec) +
+          " olsr_tc=" + std::to_string (m_adhocOlsrTcSec));
 }
 
 void
@@ -4986,8 +5731,19 @@ HeterogeneousNmsFramework::ConfigureLteMobility ()
     }
   listPosEnb->Add (Vector (ex, ey, ez));
   mobilityEnb.SetPositionAllocator (listPosEnb);
-  mobilityEnb.SetMobilityModel ("ns3::ConstantPositionMobilityModel");
+  mobilityEnb.SetMobilityModel ("ns3::ConstantVelocityMobilityModel");
   mobilityEnb.Install (m_lteEnbNodes);
+  Ptr<ConstantVelocityMobilityModel> enbMob =
+      m_lteEnbNodes.Get (0)->GetObject<ConstantVelocityMobilityModel> ();
+  if (enbMob)
+    {
+      double vxEnb = 0.0;
+      if (itEnb != m_joinConfig.end () && itEnb->second.speed > 0.0)
+        {
+          vxEnb = itEnb->second.speed;
+        }
+      enbMob->SetVelocity (Vector (vxEnb, 0.0, 0.0));
+    }
 
   MobilityHelper mobilityUe;
   Ptr<ListPositionAllocator> listPosUe = CreateObject<ListPositionAllocator> ();
@@ -5003,8 +5759,24 @@ HeterogeneousNmsFramework::ConfigureLteMobility ()
       listPosUe->Add (Vector (ux, uy, uz));
     }
   mobilityUe.SetPositionAllocator (listPosUe);
-  mobilityUe.SetMobilityModel ("ns3::ConstantPositionMobilityModel");
+  mobilityUe.SetMobilityModel ("ns3::ConstantVelocityMobilityModel");
   mobilityUe.Install (m_lteUeNodes);
+  for (uint32_t i = 0; i < m_lteUeNodes.GetN (); ++i)
+    {
+      Ptr<ConstantVelocityMobilityModel> m =
+          m_lteUeNodes.Get (i)->GetObject<ConstantVelocityMobilityModel> ();
+      if (!m)
+        {
+          continue;
+        }
+      double vx = 8.0;
+      auto itUe = m_joinConfig.find (m_lteUeNodes.Get (i)->GetId ());
+      if (itUe != m_joinConfig.end () && itUe->second.speed > 0.0)
+        {
+          vx = itUe->second.speed;
+        }
+      m->SetVelocity (Vector (vx, 0.0, 0.0));
+    }
 }
 
 void
@@ -5024,19 +5796,25 @@ HeterogeneousNmsFramework::BuildAdhocSubnet ()
   ConfigureAdhocMobility ();
 
   OlsrHelper olsr;
-  olsr.Set ("HelloInterval", TimeValue (Seconds (0.25)));
-  olsr.Set ("TcInterval", TimeValue (Seconds (0.5)));
-  olsr.Set ("MidInterval", TimeValue (Seconds (1.0)));
-  olsr.Set ("HnaInterval", TimeValue (Seconds (1.0)));
+  olsr.Set ("HelloInterval", TimeValue (Seconds (m_adhocOlsrHelloSec)));
+  olsr.Set ("TcInterval", TimeValue (Seconds (m_adhocOlsrTcSec)));
+  olsr.Set ("MidInterval", TimeValue (Seconds (std::max (1.0, m_adhocOlsrTcSec * 2.0))));
+  olsr.Set ("HnaInterval", TimeValue (Seconds (std::max (1.0, m_adhocOlsrTcSec * 2.0))));
   AodvHelper aodv;
-  aodv.Set ("HelloInterval", TimeValue (Seconds (0.25)));
-  aodv.Set ("ActiveRouteTimeout", TimeValue (Seconds (3.0)));
-  aodv.Set ("AllowedHelloLoss", UintegerValue (3));
+  aodv.Set ("HelloInterval", TimeValue (Seconds (m_adhocAodvHelloSec)));
+  aodv.Set ("ActiveRouteTimeout", TimeValue (Seconds (m_adhocAodvActiveRouteTimeoutSec)));
+  aodv.Set ("AllowedHelloLoss", UintegerValue (m_adhocAodvAllowedHelloLoss));
   Ipv4StaticRoutingHelper staticRouting;
   Ipv4ListRoutingHelper list;
   list.Add (staticRouting, 30);
-  list.Add (aodv, 20);
-  list.Add (olsr, 10);
+  if (m_routingModeEffective == ROUTING_AODV)
+    {
+      list.Add (aodv, 20);
+    }
+  else
+    {
+      list.Add (olsr, 20);
+    }
   InternetStackHelper stack;
   stack.SetRoutingHelper (list);
   stack.Install (m_adhocNodes);
@@ -5115,7 +5893,7 @@ HeterogeneousNmsFramework::BuildAdhocSubnet ()
 void
 HeterogeneousNmsFramework::ConfigureAdhocMobility ()
 {
-  // 完全由 JSON 驱动：废除 GridPositionAllocator/硬编码坐标，仅使用 m_joinConfig 中的 init_pos
+  // 完全由 JSON 驱动：位置与速度均由 join_config 驱动（未配置速度时用默认值）
   MobilityHelper mobility;
   Ptr<ListPositionAllocator> listPos = CreateObject<ListPositionAllocator> ();
   uint32_t n = m_adhocNodes.GetN ();
@@ -5131,8 +5909,24 @@ HeterogeneousNmsFramework::ConfigureAdhocMobility ()
       listPos->Add (Vector (x, y, z));
     }
   mobility.SetPositionAllocator (listPos);
-  mobility.SetMobilityModel ("ns3::ConstantPositionMobilityModel");
+  mobility.SetMobilityModel ("ns3::ConstantVelocityMobilityModel");
   mobility.Install (m_adhocNodes);
+  for (uint32_t i = 0; i < n; ++i)
+    {
+      Ptr<ConstantVelocityMobilityModel> m =
+          m_adhocNodes.Get (i)->GetObject<ConstantVelocityMobilityModel> ();
+      if (!m)
+        {
+          continue;
+        }
+      double vx = 8.0;
+      auto it = m_joinConfig.find (m_adhocNodes.Get (i)->GetId ());
+      if (it != m_joinConfig.end () && it->second.speed > 0.0)
+        {
+          vx = it->second.speed;
+        }
+      m->SetVelocity (Vector (vx, 0.0, 0.0));
+    }
 }
 
 void
@@ -5151,7 +5945,12 @@ HeterogeneousNmsFramework::BuildDataLinkSubnet ()
 
   ConfigureDataLinkMobility ();
 
+  Ipv4StaticRoutingHelper staticRouting;
+  Ipv4ListRoutingHelper list;
+  list.Add (staticRouting, 30);
+  // DataLink 子网按“民用数据链”建模：不启用网络层动态路由（AODV/OLSR），仅使用静态/受管转发。
   InternetStackHelper stack;
+  stack.SetRoutingHelper (list);
   stack.Install (m_datalinkNodes);
 
   // ----------------- 使用 802.11a，低速率 6Mbps；拓扑由 JSON 强制指定（MatrixPropagationLossModel）或默认信道 -----------------
@@ -5666,6 +6465,21 @@ HeterogeneousNmsFramework::InstallApplications ()
     app->SetChannelPorts (reportPort, spnPolicyPort, nodePolicyPort, helloPort);
     app->SetProtocolTunables (m_energyDeltaThreshold, m_stateSuppressWindowSec, m_aggregateIntervalSec);
     app->SetSpnElectionTunables (m_spnElectionTimeoutSec, static_cast<uint8_t> (m_spnHeartbeatMissThreshold));
+    // 静态算力优先读取 join_config；未配置时回退到原默认规则
+    double staticCap = -1.0;
+    if (itJoin != m_joinConfig.end () && itJoin->second.staticComputeCapability > 0.0)
+      {
+        staticCap = itJoin->second.staticComputeCapability;
+      }
+    else
+      {
+        staticCap = 0.65 + 0.05 * static_cast<double> (node->GetId () % 4);
+        if (GetNodeJoinTime (node->GetId ()) <= 0.0)
+          {
+            staticCap = 0.85 + 0.05 * static_cast<double> (node->GetId () % 3);
+          }
+      }
+    app->SetStaticComputeCapability (std::min (1.0, std::max (0.5, staticCap)));
     if (gmcBackhaulPort != 0)
       app->SetGmcBackhaul (gmcBackhaulAddr, gmcBackhaulPort);
     if (st == HeterogeneousNodeApp::SUBNET_LTE)
@@ -5881,18 +6695,27 @@ HeterogeneousNmsFramework::InstallApplications ()
       sinkApps.Start (Seconds (0.0));
       sinkApps.Stop (simTime);
 
+      // 业务流采用持续发送模型：不再依赖 scenario 的 stopTime，避免中途归零。
+      std::string bizRate = "500Kbps";
+      if (fcfg.type == "control")
+        {
+          bizRate = "100Kbps";
+        }
+      else if (fcfg.type == "video")
+        {
+          bizRate = "1.5Mbps";
+        }
       OnOffHelper onOff ("ns3::UdpSocketFactory", Address ());
       onOff.SetAttribute ("Remote", AddressValue (InetSocketAddress (dstAddr, port)));
-      onOff.SetAttribute ("DataRate", DataRateValue (DataRate (fcfg.dataRate.c_str ())));
-      onOff.SetAttribute ("PacketSize", UintegerValue (fcfg.packetSize));
+      onOff.SetAttribute ("DataRate", DataRateValue (DataRate (bizRate.c_str ())));
+      onOff.SetAttribute ("PacketSize", UintegerValue (1024));
       // Force CBR send pattern to avoid OnOff duty-cycle throughput loss.
-      onOff.SetAttribute ("OnTime", StringValue ("ns3::ConstantRandomVariable[Constant=1]"));
+      onOff.SetAttribute ("OnTime", StringValue ("ns3::ConstantRandomVariable[Constant=1000]"));
       onOff.SetAttribute ("OffTime", StringValue ("ns3::ConstantRandomVariable[Constant=0]"));
       ApplicationContainer clientApps = onOff.Install (srcNode);
-      double stopAt = (fcfg.stopTime > 0.0) ? fcfg.stopTime : m_simTimeSeconds;
       double stagger = static_cast<double> (fcfg.flowId % 5) * 0.05; // avoid synchronized burst starts
       clientApps.Start (Seconds (fcfg.startTime + stagger));
-      clientApps.Stop (Seconds (stopAt));
+      clientApps.Stop (Seconds (m_simTimeSeconds));
       {
         const uint8_t ipTos = MapBusinessPriorityToIpTos (fcfg.priority);
         Ptr<OnOffApplication> onOffApp = DynamicCast<OnOffApplication> (clientApps.Get (0));
@@ -5930,7 +6753,7 @@ HeterogeneousNmsFramework::InstallApplications ()
             }
         }
 
-      Simulator::Schedule (Seconds (fcfg.startTime), [this, fcfg, getConfiguredPath] () {
+      Simulator::Schedule (Seconds (fcfg.startTime), [this, fcfg, getConfiguredPath, bizRate] () {
           std::vector<uint32_t> path = GetOlsrPath (fcfg.srcNodeId, fcfg.dstNodeId);
           if (path.size () < 2)
             {
@@ -5941,7 +6764,7 @@ HeterogeneousNmsFramework::InstallApplications ()
               << " priority=" << static_cast<uint32_t> (fcfg.priority)
               << " qos=" << static_cast<uint32_t> (fcfg.qos)
               << " src=" << fcfg.srcNodeId << " dst=" << fcfg.dstNodeId
-              << " size=" << fcfg.packetSize << " rate=" << fcfg.dataRate
+              << " size=" << 1024 << " rate=" << bizRate
               << " type=" << fcfg.type;
           if (!path.empty ())
             {
@@ -6175,6 +6998,10 @@ HeterogeneousNmsFramework::EmitFlowPerformanceWindow ()
     }
   Ptr<Ipv4FlowClassifier> classifier = DynamicCast<Ipv4FlowClassifier> (m_flowHelper.GetClassifier ());
   FlowMonitor::FlowStatsContainer stats = m_flowMonitor->GetFlowStats ();
+  double sumLossPct = 0.0;
+  double sumDelayMs = 0.0;
+  uint32_t metricFlows = 0;
+  uint32_t zeroThrFlows = 0;
   for (auto it = stats.begin (); it != stats.end (); ++it)
     {
       const uint32_t flowId = it->first;
@@ -6211,6 +7038,13 @@ HeterogeneousNmsFramework::EmitFlowPerformanceWindow ()
       double thrMbps = (dRxBytes * 8.0) / std::max (0.001, m_flowPerfWindowSec) / 1e6;
       double delayMs = (dRx > 0) ? (dDelayMs / static_cast<double> (dRx)) : 0.0;
       double lossPct = (dTx > 0) ? (100.0 * static_cast<double> (dLost) / static_cast<double> (dTx)) : 0.0;
+      sumLossPct += lossPct;
+      sumDelayMs += delayMs;
+      metricFlows++;
+      if (thrMbps <= 1e-6)
+        {
+          zeroThrFlows++;
+        }
       std::ostringstream perfLine;
       perfLine << "bizFlowId=" << bizFlowId
                << " flowId=" << flowId
@@ -6228,6 +7062,20 @@ HeterogeneousNmsFramework::EmitFlowPerformanceWindow ()
       m_flowWindowPrev[flowId] = cur;
     }
   double now = Simulator::Now ().GetSeconds ();
+  if (m_routeAdaptRuntimeEnable && m_routingModeEffective == ROUTING_OLSR &&
+      metricFlows > 0 &&
+      (m_routeAdaptRuntimeLastEvalTs < 0.0 ||
+       now - m_routeAdaptRuntimeLastEvalTs >= m_routeAdaptRuntimeWindowSec))
+    {
+      m_routeAdaptRuntimeLastEvalTs = now;
+      double avgLossPct = sumLossPct / static_cast<double> (metricFlows);
+      double avgDelayMs = sumDelayMs / static_cast<double> (metricFlows);
+      NmsLog ("INFO", 0, "ROUTE_ADAPT_RUNTIME_METRIC",
+              "avgLossPct=" + std::to_string (avgLossPct) +
+              " avgDelayMs=" + std::to_string (avgDelayMs) +
+              " zeroThrFlows=" + std::to_string (zeroThrFlows));
+      MaybeUpdateRuntimeRouteAdapt (avgLossPct, avgDelayMs, zeroThrFlows, now);
+    }
   if (now + m_flowPerfWindowSec < m_simTimeSeconds)
     {
       Simulator::Schedule (Seconds (m_flowPerfWindowSec),
@@ -6299,20 +7147,23 @@ HeterogeneousNmsFramework::Run (double simTimeSeconds)
       if (!valErr.empty ())
         NmsLog ("WARN", 0, "JOINCONFIG_VALIDATION", valErr);
     }
+  ScenarioConfig loadedScenario;
+  bool hasScenario = false;
   if (!m_scenarioConfigPath.empty ())
     {
-      ScenarioConfig sc = LoadScenarioConfig (m_scenarioConfigPath);
-      if (sc.spnElectionTimeoutSec > 0.0)
+      loadedScenario = LoadScenarioConfig (m_scenarioConfigPath);
+      hasScenario = true;
+      if (loadedScenario.spnElectionTimeoutSec > 0.0)
         {
-          m_spnElectionTimeoutSec = sc.spnElectionTimeoutSec;
+          m_spnElectionTimeoutSec = loadedScenario.spnElectionTimeoutSec;
         }
-      if (sc.spnHeartbeatMissThreshold > 0)
+      if (loadedScenario.spnHeartbeatMissThreshold > 0)
         {
-          m_spnHeartbeatMissThreshold = sc.spnHeartbeatMissThreshold;
+          m_spnHeartbeatMissThreshold = loadedScenario.spnHeartbeatMissThreshold;
         }
-      NmsLog ("INFO", 0, "SCENARIO", "Loaded scenario: id=" + (sc.scenarioId.empty () ? "none" : sc.scenarioId)
+      NmsLog ("INFO", 0, "SCENARIO", "Loaded scenario: id=" + (loadedScenario.scenarioId.empty () ? "none" : loadedScenario.scenarioId)
               + " from " + m_scenarioConfigPath);
-      for (const auto& ev : sc.events)
+      for (const auto& ev : loadedScenario.events)
         {
           if (ev.type == "SPN_SWITCH" || ev.type == "SPN_FORCE_SWITCH")
             {
@@ -6363,6 +7214,45 @@ HeterogeneousNmsFramework::Run (double simTimeSeconds)
           "energyDeltaTh=" + std::to_string (m_energyDeltaThreshold) +
           " suppressWin=" + std::to_string (m_stateSuppressWindowSec) +
           " aggregateInterval=" + std::to_string (m_aggregateIntervalSec));
+  if (m_routeAdaptConfigured == ADAPT_AUTO)
+    {
+      m_routeAdaptEffective = DecideRouteAdaptLevelAuto (hasScenario ? &loadedScenario : nullptr);
+    }
+  else
+    {
+      m_routeAdaptEffective = m_routeAdaptConfigured;
+    }
+  ApplyAdhocRoutingAdaptiveParams ();
+  if (m_routingModeConfigured == ROUTING_AUTO)
+    {
+      m_routingModeEffective = DecideRoutingModeAuto (hasScenario ? &loadedScenario : nullptr);
+    }
+  else
+    {
+      m_routingModeEffective = m_routingModeConfigured;
+    }
+  NmsLog ("INFO", 0, "ROUTING_POLICY",
+          "configured=" + RoutingModeToString (m_routingModeConfigured) +
+          " effective=" + RoutingModeToString (m_routingModeEffective) +
+          " decision_scope=pre_run_gmc");
+  NmsLog ("INFO", 0, "ROUTE_ADAPT_POLICY",
+          "configured=" + RouteAdaptLevelToString (m_routeAdaptConfigured) +
+          " effective=" + RouteAdaptLevelToString (m_routeAdaptEffective) +
+          " olsr_hello=" + std::to_string (m_adhocOlsrHelloSec) +
+          " olsr_tc=" + std::to_string (m_adhocOlsrTcSec) +
+          " aodv_hello=" + std::to_string (m_adhocAodvHelloSec) +
+          " aodv_active_to=" + std::to_string (m_adhocAodvActiveRouteTimeoutSec) +
+          " aodv_loss=" + std::to_string (m_adhocAodvAllowedHelloLoss));
+  m_routeAdaptRuntimeLastSwitchTs = -1.0;
+  m_routeAdaptRuntimeLastEvalTs = -1.0;
+  m_routeAdaptUpgradeVotes = 0;
+  m_routeAdaptDowngradeVotes = 0;
+  NmsLog ("INFO", 0, "ROUTE_ADAPT_RUNTIME",
+          std::string ("enabled=") + (m_routeAdaptRuntimeEnable ? "1" : "0") +
+          " windowSec=" + std::to_string (m_routeAdaptRuntimeWindowSec) +
+          " cooldownSec=" + std::to_string (m_routeAdaptRuntimeCooldownSec));
+  NmsLog ("INFO", 0, "DATALINK_ROUTING",
+          "mode=managed_datalink static_only dynamic_l3_disabled");
   std::string jsonlPath = MakeOutputPathInCategory ("log", "nms-state", ".jsonl");
   g_jsonlStateFile.open (jsonlPath.c_str (), std::ios::out);
 
@@ -6870,12 +7760,6 @@ HeterogeneousNmsFramework::Run (double simTimeSeconds)
         NmsLog ("INFO", 0, "PERF", "Performance charts: " + chartPrefix + ".png");
     }
 
-  if (g_nmsLogFile.is_open ())
-    {
-      g_nmsLogFile << "========== Simulation finished ==========" << std::endl;
-      g_nmsLogFile.close ();
-    }
-
   // === 8. 抓包自动解析：若开启 pcap，解析 packet/ 下 pcap，输出至 packet/packet_parse_result_${时间戳}.txt ===
   if (m_enablePcap && !m_outputDir.empty ())
     {
@@ -6893,6 +7777,29 @@ HeterogeneousNmsFramework::Run (double simTimeSeconds)
       (void) rawRet;
       (void) aggRet;
       NmsLog ("INFO", 0, "PCAP_FILES", "raw_hnmp.pcap / agg_hnmp.pcap generated under " + m_dirPacket);
+    }
+
+  // 与 README 标准流程对齐：仿真完成后自动导出可视化数据到 visualization/data
+  if (!m_outputDir.empty ())
+    {
+      std::ostringstream exportCmd;
+      exportCmd << "python3 export_visualization_data.py \"" << m_outputDir
+                << "\" -o visualization/data 2>/dev/null";
+      int exportRet = std::system (exportCmd.str ().c_str ());
+      if (exportRet == 0)
+        {
+          NmsLog ("INFO", 0, "VIS_EXPORT", "visualization data exported to visualization/data from " + m_outputDir);
+        }
+      else
+        {
+          NmsLog ("WARN", 0, "VIS_EXPORT", "export_visualization_data.py failed for " + m_outputDir);
+        }
+    }
+
+  if (g_nmsLogFile.is_open ())
+    {
+      g_nmsLogFile << "========== Simulation finished ==========" << std::endl;
+      g_nmsLogFile.close ();
     }
 
   Simulator::Destroy ();
@@ -6914,7 +7821,7 @@ HnmsMain (int argc, char *argv[])
   double simTime = 90.0;
   int adhocTopology = 0;  // 0=MESH, 1=STAR, 2=TREE
   std::string adhocTopologyStr = "mesh";  // 可选：--adhoc-topology=star|tree|mesh
-  bool enablePacketParse = false;
+  bool enablePacketParse = true;
   bool enablePcap = false;
   bool useDualChannel = false;
   std::string joinConfigPath;
@@ -6925,6 +7832,10 @@ HnmsMain (int argc, char *argv[])
   double stateSuppressWindow = 15.0;
   double aggregateInterval = 2.0;
   std::string scenarioMode = "normal";
+  std::string routeMode = "auto";
+  std::string routeAdapt = "auto";
+  bool routeAdaptRuntime = false;
+  double routeAdaptRuntimeWindow = 5.0;
   uint32_t rngSeed = 1;
   uint32_t rngRun = 1;
   std::string hnmsConfigPath;
@@ -6934,7 +7845,9 @@ HnmsMain (int argc, char *argv[])
   cmd.AddValue ("simTime", "Simulation time in seconds", simTime);
   cmd.AddValue ("topology", "Adhoc topology: 0=MESH, 1=STAR, 2=TREE", adhocTopology);
   cmd.AddValue ("adhoc-topology", "Adhoc topology: mesh|star|tree (overrides topology if set)", adhocTopologyStr);
-  cmd.AddValue ("parsePackets", "Enable runtime packet parse (TLV/Hello/Policy) log", enablePacketParse);
+  cmd.AddValue ("parsePackets",
+                "Runtime TLV/HNMP business trace (TLV_TRACE/HELLO_TRACE/POLICY_TRACE); default on, use 0 to disable",
+                enablePacketParse);
   cmd.AddValue ("pcap", "Enable pcap trace for offline parsing", enablePcap);
   cmd.AddValue ("dualChannel", "Use control(8888)/data(9999) port separation", useDualChannel);
   cmd.AddValue ("joinConfig", "Path to node join config JSON (timed join); empty=disabled", joinConfigPath);
@@ -6945,6 +7858,10 @@ HnmsMain (int argc, char *argv[])
   cmd.AddValue ("stateSuppressWin", "State suppression window in seconds", stateSuppressWindow);
   cmd.AddValue ("aggregateInterval", "SPN aggregate interval in seconds", aggregateInterval);
   cmd.AddValue ("scenarioMode", "Scenario mode: normal|thesis30|compare-baseline|compare-hnmp", scenarioMode);
+  cmd.AddValue ("routeMode", "Routing mode for Adhoc/DataLink: auto|aodv|olsr", routeMode);
+  cmd.AddValue ("routeAdapt", "Adhoc routing adaptive level: auto|stable|degraded|critical", routeAdapt);
+  cmd.AddValue ("routeAdaptRuntime", "Enable runtime OLSR parameter adaptation (0/1), default 0", routeAdaptRuntime);
+  cmd.AddValue ("routeAdaptRuntimeWindow", "Runtime adaptation evaluation window in seconds", routeAdaptRuntimeWindow);
   cmd.AddValue ("rngSeed", "Global RNG seed for reproducible experiments", rngSeed);
   cmd.AddValue ("rngRun", "RNG run index for repeated trials", rngRun);
   cmd.AddValue ("config", "Path to hnms config.json (spn/node/link/qos/simulation); empty=search defaults",
@@ -6972,6 +7889,63 @@ HnmsMain (int argc, char *argv[])
         }
     }
   hnms::ConfigLoader::LoadFromFile (hnmsConfigPath);
+  if (std::fabs (simTime - 90.0) < 1e-9)
+    {
+      simTime = hnms::ConfigLoader::SimulationTotalTime ();
+    }
+  if (joinConfigPath.empty ())
+    {
+      joinConfigPath = hnms::ConfigLoader::SimulationJoinConfig ();
+    }
+  if (scenarioConfigPath.empty ())
+    {
+      scenarioConfigPath = hnms::ConfigLoader::SimulationScenarioConfig ();
+    }
+  if (scenarioMode == "normal")
+    {
+      scenarioMode = hnms::ConfigLoader::SimulationScenarioMode ();
+    }
+  if (enablePacketParse)
+    {
+      enablePacketParse = (hnms::ConfigLoader::SimulationParsePackets () != 0u);
+    }
+  if (!enablePcap)
+    {
+      enablePcap = (hnms::ConfigLoader::SimulationPcap () != 0u);
+    }
+  if (!useDualChannel)
+    {
+      useDualChannel = (hnms::ConfigLoader::SimulationDualChannel () != 0u);
+    }
+  if (std::fabs (energyDeltaThreshold - 0.15) < 1e-9)
+    {
+      energyDeltaThreshold = hnms::ConfigLoader::SimulationEnergyDeltaTh ();
+    }
+  if (std::fabs (stateSuppressWindow - 15.0) < 1e-9)
+    {
+      stateSuppressWindow = hnms::ConfigLoader::SimulationStateSuppressWin ();
+    }
+  if (std::fabs (aggregateInterval - 2.0) < 1e-9)
+    {
+      aggregateInterval = hnms::ConfigLoader::SimulationAggregateInterval ();
+    }
+  // 仅当未通过 CLI 显式设置时，采用 config.json 的路由/运行时调参参数，避免破坏现有命令行用法。
+  if (routeMode == "auto")
+    {
+      routeMode = hnms::ConfigLoader::SimulationRouteMode ();
+    }
+  if (routeAdapt == "auto")
+    {
+      routeAdapt = hnms::ConfigLoader::SimulationRouteAdapt ();
+    }
+  if (!routeAdaptRuntime)
+    {
+      routeAdaptRuntime = (hnms::ConfigLoader::SimulationRouteAdaptRuntime () != 0u);
+    }
+  if (std::fabs (routeAdaptRuntimeWindow - 5.0) < 1e-9)
+    {
+      routeAdaptRuntimeWindow = hnms::ConfigLoader::SimulationRouteAdaptRuntimeWindow ();
+    }
   hnms::StructuredLog::SetJsonEnabled (jsonLogFlag != 0);
   hnms::EventScheduler::Instance ().SetGlobalMaxRetry (5);
   {
@@ -7012,6 +7986,17 @@ HnmsMain (int argc, char *argv[])
   framework.SetStateSuppressWindow (stateSuppressWindow);
   framework.SetAggregateIntervalSec (aggregateInterval);
   framework.SetScenarioMode (scenarioMode);
+  framework.SetRoutingMode (routeMode);
+  framework.SetRouteAdaptLevel (routeAdapt);
+  framework.SetRouteAdaptRuntime (routeAdaptRuntime);
+  framework.SetRouteAdaptRuntimeWindowSec (routeAdaptRuntimeWindow);
+  framework.SetRouteAdaptRuntimeCooldownSec (
+#ifdef HNMS_USE_MODULES
+      hnms::ConfigLoader::SimulationRouteAdaptRuntimeCooldown ()
+#else
+      20.0
+#endif
+  );
   if (!joinConfigPath.empty ()) framework.SetJoinConfigPath (joinConfigPath);
   if (!scenarioConfigPath.empty ()) framework.SetScenarioConfigPath (scenarioConfigPath);
   if (failNodeId > 0) { framework.SetFailNodeId (failNodeId); framework.SetFailTime (failTime); }

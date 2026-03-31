@@ -31,6 +31,20 @@ public:
 
   static double SimulationTotalTime ();
   static std::uint32_t SimulationNumNodes ();
+  static std::string SimulationJoinConfig ();
+  static std::string SimulationScenarioConfig ();
+  static std::string SimulationScenarioMode ();
+  static std::uint32_t SimulationParsePackets ();
+  static std::uint32_t SimulationPcap ();
+  static std::uint32_t SimulationDualChannel ();
+  static double SimulationEnergyDeltaTh ();
+  static double SimulationStateSuppressWin ();
+  static double SimulationAggregateInterval ();
+  static std::string SimulationRouteMode ();
+  static std::string SimulationRouteAdapt ();
+  static std::uint32_t SimulationRouteAdaptRuntime ();
+  static double SimulationRouteAdaptRuntimeWindow ();
+  static double SimulationRouteAdaptRuntimeCooldown ();
 
   static std::string LastPath ();
 
@@ -49,6 +63,20 @@ private:
     double qos_tp{10.0};
     double sim_time{100.0};
     std::uint32_t sim_nodes{30};
+    std::string sim_join_config{""};
+    std::string sim_scenario_config{""};
+    std::string sim_scenario_mode{"normal"};
+    std::uint32_t sim_parse_packets{1};
+    std::uint32_t sim_pcap{0};
+    std::uint32_t sim_dual_channel{0};
+    double sim_energy_delta_th{0.15};
+    double sim_state_suppress_win{15.0};
+    double sim_aggregate_interval{2.0};
+    std::string sim_route_mode{"auto"};
+    std::string sim_route_adapt{"auto"};
+    std::uint32_t sim_route_adapt_runtime{0};
+    double sim_route_adapt_window{5.0};
+    double sim_route_adapt_cooldown{20.0};
   };
 
   static Defaults s_val;
