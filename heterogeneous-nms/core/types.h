@@ -39,6 +39,7 @@ struct BusinessFlowConfig
   uint32_t dstNodeId;
   std::string dataRate;
   uint32_t packetSize;
+  uint64_t sizeBytes;
   double startTime;
   double stopTime;
 };

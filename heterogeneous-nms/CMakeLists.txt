@@ -13,6 +13,9 @@ set(source_files
   protocol/packet-parse.cc
   app/heterogeneous-node-app.cc
   app/gmc-policy-sender-app.cc
+  app/intent-mapper.cc
+  app/policy-executor.cc
+  trace/policy-state-tracer.cc
 )
 
 # Prefix must match ns-3 nested scratch naming so `./ns3 build|run heterogeneous-nms-main`

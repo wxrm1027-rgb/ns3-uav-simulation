@@ -37,6 +37,10 @@
 #include "ns3/lte-module.h"
 #include "ns3/point-to-point-epc-helper.h"
 
+#include "../app/intent-mapper.h"
+#include "../app/policy-executor.h"
+#include "../trace/policy-state-tracer.h"
+
 #include <cmath>
 #include <algorithm>
 #include <cctype>
@@ -397,15 +401,16 @@ struct ScenarioEvent
 struct BusinessFlowConfig
 {
   uint32_t flowId;         ///< 业务流 ID
-  std::string type;        ///< 业务类型：video/control/data...
-  uint8_t priority;        ///< 优先级
-  uint8_t qos;             ///< QoS 等级
+  std::string type;        ///< 业务类型：data / video / file
+  uint8_t priority;        ///< 优先级（主字段；用于 QoS/TOS 映射）
+  uint8_t qos;             ///< 兼容旧配置；未显式提供时默认等于 priority
   uint32_t srcNodeId;      ///< 源节点 ID
   uint32_t dstNodeId;      ///< 目的节点 ID
   std::string dataRate;    ///< 速率，如 "1Mbps" / "100Kbps"
   uint32_t packetSize;     ///< 包长
-  double startTime;        ///< 开始时刻
-  double stopTime;         ///< 结束时刻（<=0 表示到仿真结束）
+  uint64_t sizeBytes;      ///< 业务总大小；>0 时由 size/rate 自动推导持续时长
+  double startTime;        ///< 兼容旧字段；<0 时自动在双方入网后开始
+  double stopTime;         ///< 兼容旧字段；<=start 时忽略，优先级低于 sizeBytes 推导
 };
 struct ScenarioConfig
 {
@@ -570,18 +575,41 @@ static ScenarioConfig LoadScenarioConfig (const std::string& path)
                 return obj.substr (q1 + 1, q2 - q1 - 1);
               };
               BusinessFlowConfig bf = {};
+              const bool hasLegacyQos = (obj.find ("\"qos\"") != std::string::npos);
+              const bool hasLegacyStop = (obj.find ("\"stop\"") != std::string::npos);
               bf.flowId = static_cast<uint32_t> (getNum ("flow_id", 0));
               bf.type = getStr ("type", "data");
               bf.priority = static_cast<uint8_t> (getNum ("priority", 1));
-              bf.qos = static_cast<uint8_t> (getNum ("qos", 1));
+              bf.qos = static_cast<uint8_t> (getNum ("qos", bf.priority));
               bf.srcNodeId = static_cast<uint32_t> (getNum ("src", 0));
               bf.dstNodeId = static_cast<uint32_t> (getNum ("dst", 0));
               bf.dataRate = getStr ("rate", "1Mbps");
               bf.packetSize = static_cast<uint32_t> (getNum ("packet_size", 512));
-              bf.startTime = getNum ("start", 5.0);
+              bf.sizeBytes = static_cast<uint64_t> (getNum ("size_bytes", 0));
+              bf.startTime = getNum ("start", -1.0);
               bf.stopTime = getNum ("stop", -1.0);
               if (bf.flowId > 0 && bf.srcNodeId != bf.dstNodeId)
-                out.businessFlows.push_back (bf);
+                {
+                  if (hasLegacyQos)
+                    {
+                      NmsLog ("WARN", 0, "SCENARIO_CONFIG",
+                              "business_flow flowId=" + std::to_string (bf.flowId) +
+                              " uses legacy field qos; please use priority only");
+                    }
+                  if (hasLegacyStop && bf.sizeBytes > 0)
+                    {
+                      NmsLog ("WARN", 0, "SCENARIO_CONFIG",
+                              "business_flow flowId=" + std::to_string (bf.flowId) +
+                              " provides both size_bytes and legacy stop; size_bytes/rate duration will take precedence");
+                    }
+                  else if (hasLegacyStop)
+                    {
+                      NmsLog ("WARN", 0, "SCENARIO_CONFIG",
+                              "business_flow flowId=" + std::to_string (bf.flowId) +
+                              " uses legacy field stop; prefer start + size_bytes + rate");
+                    }
+                  out.businessFlows.push_back (bf);
+                }
               pos = objEnd + 1;
             }
         }
@@ -1050,13 +1078,17 @@ namespace NmsPacketParse
     uint16_t valLen = (static_cast<uint16_t> (data[1]) << 8) | data[2];
     std::ostringstream oss;
     const char* typeStr = "Unknown";
-    if (type == NmsTlv::TYPE_TELEMETRY_010) typeStr = "Telemetry(0x10)";
+    if (type == NmsTlv::TYPE_TELEMETRY_010) typeStr = "Telemetry010(0x10)";
     else if (type == NmsTlv::TYPE_ROLE_011) typeStr = "Role(0x11)";
     else if (type == NmsTlv::TYPE_SUBNET_012) typeStr = "ConfigModel(0x12)";
+    else if (type == NmsTlv::TYPE_INTENT_013) typeStr = "Intent013(0x13)";
+    else if (type == NmsTlv::TYPE_EXEC_CMD_014) typeStr = "ExecCmd014(0x14)";
+    else if (type == NmsTlv::TYPE_EXEC_RESULT_015) typeStr = "ExecResult015(0x15)";
+    else if (type == NmsTlv::TYPE_INTENT_REPORT_016) typeStr = "IntentReport016(0x16)";
     else if (type == NmsTlv::TYPE_FLOW_020) typeStr = "BusinessModel(0x20)";
     else if (type == NmsTlv::TYPE_TOPO_030) typeStr = "TopologyModel(0x30)";
     else if (type == NmsTlv::TYPE_LINK_031) typeStr = "TopologyModel-LinkCtrl(0x31)";
-    else if (type == NmsTlv::TYPE_FAULT_040) typeStr = "FaultModel(0x40)";
+    else if (type == NmsTlv::TYPE_FAULT_040) typeStr = "Alert040(0x40)";
     else if (type == NmsTlv::TYPE_ROUTE_FAIL_041) typeStr = "RouteFail(0x41)";
     else if (type == NmsTlv::TYPE_HELLO_ELECTION) typeStr = "HelloElection";
     else if (type == NmsTlv::TYPE_NODE_REPORT_SPN) typeStr = "NodeReportSpn";
@@ -1065,16 +1097,76 @@ namespace NmsPacketParse
     oss << "Type=" << typeStr << "(0x" << std::hex << (int)type << std::dec << "), Len=" << valLen;
     if (len >= 3u + valLen)
       {
-        if (type == NmsTlv::TYPE_TELEMETRY_010)
+        if (type == NmsTlv::TYPE_TELEMETRY_010 && valLen == NmsTlv::TELEMETRY_010_VALUE_LEN)
           {
-            if (valLen >= 24)
+            NmsTlv::Telemetry010 t = {};
+            if (NmsTlv::ParseTelemetry010 (data, len, &t) > 0)
               {
-                double e, q, m;
-                std::memcpy (&e, data + 3, 8);
-                std::memcpy (&q, data + 11, 8);
-                std::memcpy (&m, data + 19, 8);
-                oss << " [energy=" << std::fixed << std::setprecision (3) << e
-                    << ", linkQ=" << q << ", mobility=" << m << "]";
+                oss << " [NodeID=" << static_cast<uint32_t> (t.nodeId)
+                    << ", BatteryLevel=" << static_cast<uint32_t> (t.batteryLevel)
+                    << ", PosX=" << std::fixed << std::setprecision (3) << t.posX
+                    << ", PosY=" << t.posY
+                    << ", PosZ=" << t.posZ
+                    << ", Vx=" << t.vx
+                    << ", Vy=" << t.vy
+                    << ", Vz=" << t.vz << "]";
+              }
+          }
+        else if (type == NmsTlv::TYPE_INTENT_013 && valLen == NmsTlv::INTENT_013_VALUE_LEN)
+          {
+            NmsTlv::Intent013 t = {};
+            if (NmsTlv::ParseIntent013 (data, len, &t) > 0)
+              {
+                oss << " [IntentID=" << static_cast<uint32_t> (t.intentId)
+                    << ", IntentType=" << static_cast<uint32_t> (t.intentType)
+                    << ", ValidTime=" << t.validTime
+                    << ", Param1=" << t.param1
+                    << ", Param2=" << static_cast<uint32_t> (t.param2) << "]";
+              }
+          }
+        else if (type == NmsTlv::TYPE_EXEC_CMD_014 && valLen == NmsTlv::EXEC_CMD_014_VALUE_LEN)
+          {
+            NmsTlv::ExecCmd014 t = {};
+            if (NmsTlv::ParseExecCmd014 (data, len, &t) > 0)
+              {
+                oss << " [IntentID=" << static_cast<uint32_t> (t.intentId)
+                    << ", CmdSeq=" << static_cast<uint32_t> (t.cmdSeq)
+                    << ", TargetNodeID=" << static_cast<uint32_t> (t.targetNodeId)
+                    << ", CmdType=" << static_cast<uint32_t> (t.cmdType)
+                    << ", CmdParam=" << t.cmdParam << "]";
+              }
+          }
+        else if (type == NmsTlv::TYPE_EXEC_RESULT_015 && valLen == NmsTlv::EXEC_RESULT_015_VALUE_LEN)
+          {
+            NmsTlv::ExecResult015 t = {};
+            if (NmsTlv::ParseExecResult015 (data, len, &t) > 0)
+              {
+                oss << " [IntentID=" << static_cast<uint32_t> (t.intentId)
+                    << ", CmdSeq=" << static_cast<uint32_t> (t.cmdSeq)
+                    << ", ExecResult=" << static_cast<uint32_t> (t.execResult)
+                    << ", FailReason=" << static_cast<uint32_t> (t.failReason) << "]";
+              }
+          }
+        else if (type == NmsTlv::TYPE_INTENT_REPORT_016 && valLen == NmsTlv::INTENT_REPORT_016_VALUE_LEN)
+          {
+            NmsTlv::IntentReport016 t = {};
+            if (NmsTlv::ParseIntentReport016 (data, len, &t) > 0)
+              {
+                oss << " [IntentID=" << static_cast<uint32_t> (t.intentId)
+                    << ", TotalTargets=" << static_cast<uint32_t> (t.totalTargets)
+                    << ", SuccessCount=" << static_cast<uint32_t> (t.successCount)
+                    << ", FailCount=" << static_cast<uint32_t> (t.failCount) << "]";
+              }
+          }
+        else if (type == NmsTlv::TYPE_FAULT_040 && valLen == NmsTlv::ALERT_040_VALUE_LEN)
+          {
+            NmsTlv::Alert040 t = {};
+            if (NmsTlv::ParseAlert040 (data, len, &t) > 0)
+              {
+                oss << " [ReportNodeID=" << static_cast<uint32_t> (t.reportNodeId)
+                    << ", TargetNodeID=" << static_cast<uint32_t> (t.targetNodeId)
+                    << ", AlertLevel=" << static_cast<uint32_t> (t.alertLevel)
+                    << ", AlertReason=" << static_cast<uint32_t> (t.alertReason) << "]";
               }
           }
         else if (type == NmsTlv::TYPE_LINK_031 && valLen >= 8)
@@ -1295,6 +1387,10 @@ public:
   static void ResetSharedElectionState ();
   /// 子网内 join_time<=0 的节点数，用于首轮选举等待分数视图收敛
   static void SetExpectedInitialElectionMembers (SubnetType st, uint32_t count);
+  /// 当前真实 SPN：来自共享选举状态中的 primaryId；0 表示尚未确定。
+  static uint32_t GetCurrentPrimaryIdForSubnet (SubnetType st);
+  /// 事件触发：对外暴露的 0x41 业务路由失败告警上报入口
+  void ReportRouteFail041 (uint8_t flowId, uint8_t failReason, const char* reason);
 
 protected:
   virtual void StartApplication (void); ///< Application 启动时被调用
@@ -1442,6 +1538,27 @@ private:
   /// 选举状态变更后由当选 Primary 节点输出 SPN_ANNOUNCE（当 RunFullElection 调用者非 Primary 时由调度执行）
   void PublishSpnAnnounceAfterElection (double primaryScoreVal, double backupScoreVal, const std::string& changeReason);
   static Ptr<HeterogeneousNodeApp> FindHetAppOnNode (uint32_t nodeId, SubnetType st);
+  bool IsEligiblePolicyTarget (uint32_t targetNodeId, std::string* rejectReason = nullptr) const;
+  bool NodeSupportsIntent (uint32_t targetNodeId, uint8_t intentType,
+                           std::string* rejectReason = nullptr) const;
+  bool CheckHasWifiNetDevice (uint32_t targetNodeId) const;
+  std::string GetNodeSubnetType (uint32_t targetNodeId) const;
+  double GetCurrentWifiTxPower (uint32_t targetNodeId) const;
+  void TracePolicyState (uint32_t targetNodeId, uint8_t intentType, const std::string& stage,
+                         double oldTxPower, double newTxPower, bool hasWifi, bool selected,
+                         bool success, uint32_t errorCode, const std::string& reason) const;
+  uint8_t SelectSinglePolicyTarget (std::string* reason = nullptr) const;
+  uint8_t SelectSinglePolicyTargetByIntent (uint8_t intentType, std::string* reason = nullptr) const;
+  void RefreshPolicyTargetStateCache ();
+  Ipv4Address ResolveNodeSubnetAddress (uint32_t targetNodeId) const;
+
+  /// 论文第四章标准 TLV：0x11 节点角色状态 / 0x41 业务路由失败告警
+  static uint8_t GetRoleTypeCode (bool isSpn, bool isBackupSpn);
+  uint8_t GetComputeLevelCode () const;
+  void LogStandardTlvEvent (const char* stage, uint8_t type, const std::string& details) const;
+  void EmitRoleStatus011 (const char* reason, bool forceForwardToGmc = false);
+  void EmitRouteFail041 (uint8_t flowId, uint8_t failReason, const char* reason, bool forceForwardToGmc = false);
+  void UpdateRoleStateAndMaybeEmit011 (bool oldIsSpn, bool oldIsBackup, const char* reason);
 
   /// SPN：接收子网内节点上报，聚合缓存（含拓扑解码）
   void RecvFromSubnet (Ptr<Socket> socket);
@@ -1680,8 +1797,24 @@ private:
     double energy, linkQ;
     std::vector<uint32_t> neighborIds;
   };
+  struct IntentExecState
+  {
+    uint8_t totalTargets {0};
+    uint8_t successCount {0};
+    uint8_t failCount {0};
+    std::set<uint8_t> reportedCmdSeqs;
+  };
   std::map<uint32_t, NodeReportState> m_subnetNodeStates;
   std::set<std::pair<uint32_t, uint32_t>> m_subnetEdges;  ///< 拓扑边 (from, to)，from < to 存储
+  uint8_t m_lastRoleTypeCode;
+  std::map<uint16_t, double> m_lastRouteFailTsByFlow;
+  uint8_t m_nextCmdSeq;
+  uint8_t m_nextIntentId;
+  std::map<uint8_t, IntentExecState> m_intentExecStates;
+
+  // ===== TSN 节点侧真实策略执行层 =====
+  IntentMapper m_intentMapper;
+  PolicyExecutor m_policyExecutor;
 };
 
 HeterogeneousNodeApp::HeterogeneousNodeApp ()
@@ -1772,7 +1905,10 @@ HeterogeneousNodeApp::HeterogeneousNodeApp ()
     m_spnDeltaThreshold (DELTA_TH),
     m_isClusterHead (false),
     m_chScoreSaved (),
-    m_chPeriodicEvent ()
+    m_chPeriodicEvent (),
+    m_lastRoleTypeCode (0xff),
+    m_nextCmdSeq (1),
+    m_nextIntentId (1)
 {
   // 初始化随机数与 UV-MIB
   m_rand = CreateObject<UniformRandomVariable> ();
@@ -1849,6 +1985,201 @@ HeterogeneousNodeApp::SetExpectedInitialElectionMembers (SubnetType st, uint32_t
     {
       s_expectedDatalinkInitialMembers = count;
     }
+}
+
+uint32_t
+HeterogeneousNodeApp::GetCurrentPrimaryIdForSubnet (SubnetType st)
+{
+  if (st == SUBNET_LTE)
+    {
+      for (uint32_t i = 0; i < NodeList::GetNNodes (); ++i)
+        {
+          Ptr<HeterogeneousNodeApp> app = FindHetAppOnNode (i, st);
+          if (app && app->IsApplicationRunning () && app->m_lteIsEnb)
+            {
+              return i;
+            }
+        }
+      return 0;
+    }
+  auto it = s_sharedSpnState.find (static_cast<uint8_t> (st));
+  if (it == s_sharedSpnState.end ())
+    {
+      return 0;
+    }
+  return it->second.primaryId;
+}
+
+uint8_t
+HeterogeneousNodeApp::GetRoleTypeCode (bool isSpn, bool isBackupSpn)
+{
+  if (isSpn)
+    {
+      return 1;
+    }
+  if (isBackupSpn)
+    {
+      return 2;
+    }
+  return 3;
+}
+
+uint8_t
+HeterogeneousNodeApp::GetComputeLevelCode () const
+{
+  double v = std::max (0.0, std::min (1.0, m_staticComputeCapability));
+  return static_cast<uint8_t> (std::round (v * 255.0));
+}
+
+void
+HeterogeneousNodeApp::LogStandardTlvEvent (const char* stage, uint8_t type, const std::string& details) const
+{
+  std::ostringstream oss;
+  oss << "stage=" << stage << " type=0x" << std::hex << std::setw (2) << std::setfill ('0')
+      << static_cast<uint32_t> (type) << std::dec << " node=" << GetNode ()->GetId () << " " << details;
+  NMS_LOG_INFO (GetNode ()->GetId (), stage, oss.str ());
+}
+
+void
+HeterogeneousNodeApp::EmitRoleStatus011 (const char* reason, bool forceForwardToGmc)
+{
+  if (!m_running || !m_socket)
+    {
+      return;
+    }
+  NmsTlv::Role011 role = {};
+  role.nodeId = static_cast<uint8_t> (GetNode ()->GetId () & 0xffu);
+  role.roleType = GetRoleTypeCode (m_isSpn, m_isBackupSpn);
+  role.computeLevel = GetComputeLevelCode ();
+  uint8_t tlvBuf[32];
+  uint8_t frameBuf[64];
+  uint32_t tlvLen = NmsTlv::BuildRole011Payload (tlvBuf, sizeof (tlvBuf), role);
+  if (tlvLen == 0)
+    {
+      return;
+    }
+  std::ostringstream build;
+  build << "reason=" << reason << " roleType=" << static_cast<uint32_t> (role.roleType)
+        << " computeLevel=" << static_cast<uint32_t> (role.computeLevel);
+  LogStandardTlvEvent ("HNMP_TLV_BUILD", NmsTlv::TYPE_ROLE_011, build.str ());
+
+  Ipv4Address dstAddr = Ipv4Address ("0.0.0.0");
+  uint16_t dstPort = 0;
+  uint8_t dstId = 0;
+  if (!m_isSpn && m_reportTargetAddress != Ipv4Address ("0.0.0.0"))
+    {
+      dstAddr = m_reportTargetAddress;
+      dstPort = m_subnetReportPort;
+      dstId = 0xFE;
+    }
+  else if ((m_isSpn || forceForwardToGmc) && m_gmcBackhaulAddress != Ipv4Address ("0.0.0.0") && m_gmcBackhaulPort != 0)
+    {
+      dstAddr = m_gmcBackhaulAddress;
+      dstPort = m_gmcBackhaulPort;
+      dstId = 0;
+    }
+  if (dstPort == 0)
+    {
+      return;
+    }
+  uint32_t frameLen = BuildHnmpFrame (Hnmp::FRAME_REPORT, 1, dstId, tlvBuf, tlvLen, frameBuf, sizeof (frameBuf));
+  if (frameLen == 0)
+    {
+      return;
+    }
+  m_socket->Send (Create<Packet> (frameBuf, frameLen));
+  NmsPacketParse::LogDataPacket (GetNode ()->GetId (), "SEND", Ipv4Address ("0.0.0.0"), dstAddr, 0, dstPort, frameBuf, frameLen);
+  std::ostringstream tx;
+  tx << "reason=" << reason << " dst=" << dstAddr << ":" << dstPort
+     << " roleType=" << static_cast<uint32_t> (role.roleType)
+     << " computeLevel=" << static_cast<uint32_t> (role.computeLevel);
+  LogStandardTlvEvent ("HNMP_TLV_TX", NmsTlv::TYPE_ROLE_011, tx.str ());
+}
+
+void
+HeterogeneousNodeApp::EmitRouteFail041 (uint8_t flowId, uint8_t failReason, const char* reason, bool forceForwardToGmc)
+{
+  if (!m_running || !m_socket)
+    {
+      return;
+    }
+  double now = Simulator::Now ().GetSeconds ();
+  auto it = m_lastRouteFailTsByFlow.find (flowId);
+  if (it != m_lastRouteFailTsByFlow.end () && now - it->second < 1.0)
+    {
+      return;
+    }
+  m_lastRouteFailTsByFlow[flowId] = now;
+
+  NmsTlv::RouteFail041 alert = {};
+  alert.flowId = flowId;
+  alert.faultNodeId = static_cast<uint8_t> (GetNode ()->GetId () & 0xffu);
+  alert.failReason = failReason;
+  uint8_t tlvBuf[32];
+  uint8_t frameBuf[64];
+  uint32_t tlvLen = NmsTlv::BuildRouteFail041Payload (tlvBuf, sizeof (tlvBuf), alert);
+  if (tlvLen == 0)
+    {
+      return;
+    }
+  std::ostringstream build;
+  build << "reason=" << reason << " flowId=" << flowId
+        << " faultNodeId=" << static_cast<uint32_t> (alert.faultNodeId)
+        << " failReason=" << static_cast<uint32_t> (alert.failReason);
+  LogStandardTlvEvent ("HNMP_TLV_BUILD", NmsTlv::TYPE_ROUTE_FAIL_041, build.str ());
+
+  Ipv4Address dstAddr = Ipv4Address ("0.0.0.0");
+  uint16_t dstPort = 0;
+  uint8_t dstId = 0;
+  if (!m_isSpn && m_reportTargetAddress != Ipv4Address ("0.0.0.0"))
+    {
+      dstAddr = m_reportTargetAddress;
+      dstPort = m_subnetReportPort;
+      dstId = 0xFE;
+    }
+  else if ((m_isSpn || forceForwardToGmc) && m_gmcBackhaulAddress != Ipv4Address ("0.0.0.0") && m_gmcBackhaulPort != 0)
+    {
+      dstAddr = m_gmcBackhaulAddress;
+      dstPort = m_gmcBackhaulPort;
+      dstId = 0;
+    }
+  if (dstPort == 0)
+    {
+      return;
+    }
+  uint32_t frameLen = BuildHnmpFrame (Hnmp::FRAME_ALERT, 1, dstId, tlvBuf, tlvLen, frameBuf, sizeof (frameBuf));
+  if (frameLen == 0)
+    {
+      return;
+    }
+  m_socket->Send (Create<Packet> (frameBuf, frameLen));
+  NmsPacketParse::LogDataPacket (GetNode ()->GetId (), "SEND", Ipv4Address ("0.0.0.0"), dstAddr, 0, dstPort, frameBuf, frameLen);
+  std::ostringstream tx;
+  tx << "reason=" << reason << " dst=" << dstAddr << ":" << dstPort
+     << " flowId=" << flowId << " failReason=" << static_cast<uint32_t> (failReason);
+  LogStandardTlvEvent ("HNMP_TLV_TX", NmsTlv::TYPE_ROUTE_FAIL_041, tx.str ());
+}
+
+void
+HeterogeneousNodeApp::UpdateRoleStateAndMaybeEmit011 (bool oldIsSpn, bool oldIsBackup, const char* reason)
+{
+  uint8_t newRole = GetRoleTypeCode (m_isSpn, m_isBackupSpn);
+  uint8_t oldRole = GetRoleTypeCode (oldIsSpn, oldIsBackup);
+  if (m_lastRoleTypeCode == 0xff)
+    {
+      m_lastRoleTypeCode = oldRole;
+    }
+  if (newRole != m_lastRoleTypeCode || newRole != oldRole)
+    {
+      EmitRoleStatus011 (reason, m_isSpn);
+      m_lastRoleTypeCode = newRole;
+    }
+}
+
+void
+HeterogeneousNodeApp::ReportRouteFail041 (uint8_t flowId, uint8_t failReason, const char* reason)
+{
+  EmitRouteFail041 (flowId, failReason, reason, false);
 }
 
 uint32_t
@@ -2927,6 +3258,7 @@ HeterogeneousNodeApp::RunFullElection (const std::string& electReason)
           Simulator::Now ().GetSeconds () + static_cast<double> (m_heartbeatMissThreshold) * HEARTBEAT_SEC + HEARTBEAT_SEC;
     }
   m_lastSyncedCommittedPrimaryId = m_committedPrimaryId;
+  UpdateRoleStateAndMaybeEmit011 (wasSpn, wasBackup, stateChanged ? changeReason.c_str () : "role_sync");
 
   // 普通节点：上报目标对应当前「有效」主 SPN；无邻居地址时再尝试备 SPN
   if (!m_isSpn && spnNodeId != selfId)
@@ -2942,6 +3274,14 @@ HeterogeneousNodeApp::RunFullElection (const std::string& electReason)
           else
             m_reportTargetAddress = Ipv4Address ("0.0.0.0");
         }
+      std::ostringstream route;
+      route << "self=" << selfId
+            << " primary=" << spnNodeId
+            << " backup=" << backupNodeId
+            << " reportTarget=" << m_reportTargetAddress
+            << " hasPrimaryNeighbor=" << (m_neighborAddrs.find (spnNodeId) != m_neighborAddrs.end () ? 1 : 0)
+            << " hasBackupNeighbor=" << (m_neighborAddrs.find (backupNodeId) != m_neighborAddrs.end () ? 1 : 0);
+      NMS_LOG_INFO (selfId, "REPORT_TARGET_SYNC", route.str ());
     }
 
   if (m_isSpn && !wasSpn)
@@ -3071,6 +3411,383 @@ HeterogeneousNodeApp::FindHetAppOnNode (uint32_t nodeId, SubnetType st)
         }
     }
   return nullptr;
+}
+
+bool
+HeterogeneousNodeApp::IsEligiblePolicyTarget (uint32_t targetNodeId, std::string* rejectReason) const
+{
+  uint32_t selfId = GetNode ()->GetId ();
+  if (targetNodeId == selfId)
+    {
+      if (rejectReason) *rejectReason = "self";
+      return false;
+    }
+  Ptr<HeterogeneousNodeApp> targetApp = FindHetAppOnNode (targetNodeId, m_subnetType);
+  if (!targetApp)
+    {
+      if (rejectReason) *rejectReason = "app_missing";
+      return false;
+    }
+  if (!targetApp->IsApplicationRunning ())
+    {
+      if (rejectReason) *rejectReason = "offline_running_false";
+      return false;
+    }
+  if (targetApp->GetUvMibEnergy () <= 0.0)
+    {
+      if (rejectReason) *rejectReason = "fault_energy_zero";
+      return false;
+    }
+  if (targetApp->IsSpn () || targetApp->IsBackupSpn ())
+    {
+      if (rejectReason) *rejectReason = "not_tsn spn_role";
+      return false;
+    }
+  if (rejectReason) *rejectReason = "ok";
+  return true;
+}
+
+bool
+HeterogeneousNodeApp::NodeSupportsIntent (uint32_t targetNodeId, uint8_t intentType,
+                                          std::string* rejectReason) const
+{
+  if (intentType != 1)
+    {
+      if (rejectReason) *rejectReason = "ok";
+      return true;
+    }
+
+  // TX_POWER 仅允许在具备 WifiNetDevice 的非 LTE 子网节点执行。
+  if (m_subnetType == SUBNET_LTE)
+    {
+      if (rejectReason) *rejectReason = "skip_lte_for_tx_power";
+      return false;
+    }
+
+  if (targetNodeId >= NodeList::GetNNodes ())
+    {
+      if (rejectReason) *rejectReason = "node_out_of_range";
+      return false;
+    }
+
+  if (CheckHasWifiNetDevice (targetNodeId))
+    {
+      if (rejectReason) *rejectReason = "ok";
+      return true;
+    }
+
+  if (rejectReason) *rejectReason = "no_wifi_netdevice";
+  return false;
+}
+
+bool
+HeterogeneousNodeApp::CheckHasWifiNetDevice (uint32_t targetNodeId) const
+{
+  if (targetNodeId >= NodeList::GetNNodes ())
+    {
+      return false;
+    }
+  Ptr<Node> targetNode = NodeList::GetNode (targetNodeId);
+  if (!targetNode)
+    {
+      return false;
+    }
+  for (uint32_t i = 0; i < targetNode->GetNDevices (); ++i)
+    {
+      if (DynamicCast<WifiNetDevice> (targetNode->GetDevice (i)))
+        {
+          return true;
+        }
+    }
+  return false;
+}
+
+std::string
+HeterogeneousNodeApp::GetNodeSubnetType (uint32_t targetNodeId) const
+{
+  (void) targetNodeId;
+  switch (m_subnetType)
+    {
+    case SUBNET_ADHOC:
+      return "ADHOC";
+    case SUBNET_DATALINK:
+      return "DATALINK";
+    case SUBNET_LTE:
+      return "LTE";
+    default:
+      return "UNKNOWN";
+    }
+}
+
+double
+HeterogeneousNodeApp::GetCurrentWifiTxPower (uint32_t targetNodeId) const
+{
+  bool hasValue = false;
+  double mirrored = hnms::PolicyStateTracer::GetMirroredTxPower (targetNodeId, &hasValue);
+  if (hasValue)
+    {
+      return mirrored;
+    }
+  return std::numeric_limits<double>::quiet_NaN ();
+}
+
+void
+HeterogeneousNodeApp::TracePolicyState (uint32_t targetNodeId, uint8_t intentType, const std::string& stage,
+                                        double oldTxPower, double newTxPower, bool hasWifi, bool selected,
+                                        bool success, uint32_t errorCode, const std::string& reason) const
+{
+  hnms::PolicyStateTraceRecord record;
+  record.time = Simulator::Now ().GetSeconds ();
+  record.nodeId = targetNodeId;
+  record.subnet = GetNodeSubnetType (targetNodeId);
+  record.intentType = intentType;
+  record.stage = stage;
+  record.oldTxPower = oldTxPower;
+  record.newTxPower = newTxPower;
+  record.hasWifi = hasWifi;
+  record.selected = selected;
+  record.success = success;
+  record.errorCode = errorCode;
+  record.reason = reason;
+  hnms::PolicyStateTracer::Log (record);
+}
+
+uint8_t
+HeterogeneousNodeApp::SelectSinglePolicyTarget (std::string* reason) const
+{
+  std::ostringstream trace;
+  bool first = true;
+  for (const auto& kv : m_subnetNodeStates)
+    {
+      std::string reject;
+      bool ok = IsEligiblePolicyTarget (kv.first, &reject);
+      if (!first) trace << "; ";
+      first = false;
+      trace << "node=" << kv.first << ":" << reject;
+      if (ok)
+        {
+          if (reason) *reason = trace.str ();
+          return static_cast<uint8_t> (kv.first & 0xffu);
+        }
+    }
+  for (const auto& kv : m_neighborAddrs)
+    {
+      if (m_subnetNodeStates.find (kv.first) != m_subnetNodeStates.end ())
+        {
+          continue;
+        }
+      std::string reject;
+      bool ok = IsEligiblePolicyTarget (kv.first, &reject);
+      if (!first) trace << "; ";
+      first = false;
+      trace << "node=" << kv.first << ":" << reject;
+      if (ok)
+        {
+          if (reason) *reason = trace.str ();
+          return static_cast<uint8_t> (kv.first & 0xffu);
+        }
+    }
+  if (reason)
+    {
+      *reason = trace.str ().empty () ? "no_candidates_in_state_tables" : trace.str ();
+    }
+  return 0xFF;
+}
+
+uint8_t
+HeterogeneousNodeApp::SelectSinglePolicyTargetByIntent (uint8_t intentType, std::string* reason) const
+{
+  if (intentType != 1)
+    {
+      return SelectSinglePolicyTarget (reason);
+    }
+
+  uint32_t nodeId = GetNode ()->GetId ();
+  if (m_subnetType == SUBNET_LTE)
+    {
+      if (reason)
+        {
+          *reason = "skip_lte_for_tx_power";
+        }
+      TracePolicyState (nodeId, intentType, "REJECT",
+                        GetCurrentWifiTxPower (nodeId), std::numeric_limits<double>::quiet_NaN (),
+                        CheckHasWifiNetDevice (nodeId), false, false, EXEC_ERR_UNSUPPORTED_ACTION,
+                        "skip_lte_for_tx_power");
+      NMS_LOG_WARN (nodeId, "PROXY_POLICY",
+                    "skip LTE for TX_POWER: subnet has no WiFi-capable TSN target");
+      return 0xFF;
+    }
+
+  std::ostringstream trace;
+  bool first = true;
+  auto appendTrace = [&trace, &first] (uint32_t targetId, const std::string& why) {
+    if (!first)
+      {
+        trace << "; ";
+      }
+    first = false;
+    trace << "node=" << targetId << ":" << why;
+  };
+
+  auto tryCandidate = [this, nodeId, intentType, &appendTrace] (uint32_t targetId, uint8_t* outTarget) {
+    std::string reject;
+    if (!IsEligiblePolicyTarget (targetId, &reject))
+      {
+        appendTrace (targetId, reject);
+        TracePolicyState (targetId, intentType, "FILTER",
+                          GetCurrentWifiTxPower (targetId), std::numeric_limits<double>::quiet_NaN (),
+                          CheckHasWifiNetDevice (targetId), false, false, EXEC_ERR_UNSUPPORTED_ACTION,
+                          reject);
+        return false;
+      }
+
+    std::string capabilityReject;
+    if (!NodeSupportsIntent (targetId, intentType, &capabilityReject))
+      {
+        appendTrace (targetId, capabilityReject);
+        TracePolicyState (targetId, intentType, "FILTER",
+                          GetCurrentWifiTxPower (targetId), std::numeric_limits<double>::quiet_NaN (),
+                          CheckHasWifiNetDevice (targetId), false, false, EXEC_ERR_UNSUPPORTED_ACTION,
+                          capabilityReject);
+        if (capabilityReject == "skip_lte_for_tx_power")
+          {
+            NMS_LOG_WARN (nodeId, "PROXY_POLICY",
+                          "skip LTE for TX_POWER candidate node=" + std::to_string (targetId));
+          }
+        else if (capabilityReject == "no_wifi_netdevice")
+          {
+            NMS_LOG_WARN (nodeId, "PROXY_POLICY",
+                          "skip candidate node=" + std::to_string (targetId)
+                          + " for TX_POWER: no WifiNetDevice");
+          }
+        return false;
+      }
+
+    appendTrace (targetId, "selected_tx_power_target");
+    *outTarget = static_cast<uint8_t> (targetId & 0xffu);
+    TracePolicyState (targetId, intentType, "SELECT",
+                      GetCurrentWifiTxPower (targetId), std::numeric_limits<double>::quiet_NaN (),
+                      true, true, false, EXEC_ERR_NONE, "selected_tx_power_target");
+    NMS_LOG_INFO (nodeId, "PROXY_POLICY",
+                  "selected TX_POWER target node=" + std::to_string (targetId)
+                  + " (wifi-capable non-SPN TSN)");
+    return true;
+  };
+
+  uint8_t selected = 0xFF;
+  for (const auto& kv : m_subnetNodeStates)
+    {
+      if (tryCandidate (kv.first, &selected))
+        {
+          if (reason) *reason = trace.str ();
+          return selected;
+        }
+    }
+  for (const auto& kv : m_neighborAddrs)
+    {
+      if (m_subnetNodeStates.find (kv.first) != m_subnetNodeStates.end ())
+        {
+          continue;
+        }
+      if (tryCandidate (kv.first, &selected))
+        {
+          if (reason) *reason = trace.str ();
+          return selected;
+        }
+    }
+
+  if (reason)
+    {
+      *reason = trace.str ().empty () ? "no_tx_power_candidates" : trace.str ();
+    }
+  TracePolicyState (nodeId, intentType, "REJECT",
+                    GetCurrentWifiTxPower (nodeId), std::numeric_limits<double>::quiet_NaN (),
+                    CheckHasWifiNetDevice (nodeId), false, false, EXEC_ERR_UNSUPPORTED_ACTION,
+                    "no_executable_target_for_tx_power");
+  NMS_LOG_WARN (nodeId, "PROXY_POLICY",
+                "no executable target for TX_POWER intent in current subnet"
+                + std::string (trace.str ().empty () ? "" : " trace=" + trace.str ()));
+  return 0xFF;
+}
+
+
+void
+HeterogeneousNodeApp::RefreshPolicyTargetStateCache ()
+{
+  if (!(m_subnetType == SUBNET_ADHOC || m_subnetType == SUBNET_DATALINK || m_subnetType == SUBNET_LTE))
+    {
+      return;
+    }
+  for (uint32_t i = 0; i < NodeList::GetNNodes (); ++i)
+    {
+      Ptr<HeterogeneousNodeApp> app = FindHetAppOnNode (i, m_subnetType);
+      if (!app || !app->IsApplicationRunning ())
+        {
+          continue;
+        }
+      NodeReportState st = {};
+      st.nodeId = i;
+      Ptr<MobilityModel> mob = app->GetNode ()->GetObject<MobilityModel> ();
+      if (mob)
+        {
+          Vector pos = mob->GetPosition ();
+          Vector vel = mob->GetVelocity ();
+          st.px = pos.x; st.py = pos.y; st.pz = pos.z;
+          st.vx = static_cast<float> (vel.x);
+          st.vy = static_cast<float> (vel.y);
+          st.vz = static_cast<float> (vel.z);
+        }
+      st.energy = app->GetUvMibEnergy ();
+      st.linkQ = app->GetUvMibLinkQuality ();
+      m_subnetNodeStates[i] = st;
+      Ipv4Address addr = ResolveNodeSubnetAddress (i);
+      if (addr != Ipv4Address ("0.0.0.0"))
+        {
+          m_neighborAddrs[i] = addr;
+        }
+    }
+}
+
+Ipv4Address
+HeterogeneousNodeApp::ResolveNodeSubnetAddress (uint32_t targetNodeId) const
+{
+  Ptr<Node> n = NodeList::GetNode (targetNodeId);
+  if (!n)
+    {
+      return Ipv4Address ("0.0.0.0");
+    }
+  Ptr<Ipv4> ipv4 = n->GetObject<Ipv4> ();
+  if (!ipv4)
+    {
+      return Ipv4Address ("0.0.0.0");
+    }
+  for (uint32_t i = 1; i < ipv4->GetNInterfaces (); ++i)
+    {
+      for (uint32_t j = 0; j < ipv4->GetNAddresses (i); ++j)
+        {
+          Ipv4Address addr = ipv4->GetAddress (i, j).GetLocal ();
+          if (addr == Ipv4Address ("127.0.0.1") || addr == Ipv4Address ("0.0.0.0"))
+            {
+              continue;
+            }
+          std::ostringstream addrOss;
+          addrOss << addr;
+          std::string s = addrOss.str ();
+          if (m_subnetType == SUBNET_ADHOC && s.rfind ("10.1.", 0) == 0)
+            {
+              return addr;
+            }
+          if (m_subnetType == SUBNET_DATALINK && s.rfind ("10.2.", 0) == 0)
+            {
+              return addr;
+            }
+          if (m_subnetType == SUBNET_LTE && s.rfind ("10.103.", 0) == 0)
+            {
+              return addr;
+            }
+        }
+    }
+  return Ipv4Address ("0.0.0.0");
 }
 
 void
@@ -3659,33 +4376,163 @@ HeterogeneousNodeApp::RecvFromSubnet (Ptr<Socket> socket)
       NmsPacketParse::LogDataPacket (GetNode ()->GetId (), "RECV", src, Ipv4Address ("0.0.0.0"), iaddr.GetPort (), m_subnetReportPort, payload, payloadLen);
       m_aggregateBuf[src] = std::vector<uint8_t> (payload, payload + payloadLen);
 
-      // 解码 TYPE_NODE_REPORT_SPN，更新子网拓扑（节点状态 + 边）
       const uint8_t* buf = payload;
-      if (payloadLen >= 3 && buf[0] == NmsTlv::TYPE_NODE_REPORT_SPN)
+      if (payloadLen >= 3 && buf[0] == NmsTlv::TYPE_TELEMETRY_010)
         {
-          uint16_t valLen = (static_cast<uint16_t> (buf[1]) << 8) | buf[2];
-          if (payloadLen >= 3u + valLen && valLen >= 4 + 24 + 12 + 8 + 8 + 2)
+          std::ostringstream rx;
+          rx << "src=" << src << " bytes=" << payloadLen;
+          LogStandardTlvEvent ("HNMP_TLV_RX", NmsTlv::TYPE_TELEMETRY_010, rx.str ());
+          NmsTlv::Telemetry010 t = {};
+          if (NmsTlv::ParseTelemetry010 (buf, payloadLen, &t) > 0)
             {
-              NodeReportState st;
-              std::vector<uint32_t> neighborIds;
-              uint32_t consumed = NmsTlv::ParseNodeReportSpn (buf + 3, valLen,
-                                                              &st.nodeId, &st.px, &st.py, &st.pz,
-                                                              &st.vx, &st.vy, &st.vz,
-                                                              &st.energy, &st.linkQ,
-                                                              &neighborIds);
-              if (consumed > 0)
+              NodeReportState st = {};
+              st.nodeId = t.nodeId;
+              st.px = t.posX;
+              st.py = t.posY;
+              st.pz = t.posZ;
+              st.vx = t.vx;
+              st.vy = t.vy;
+              st.vz = t.vz;
+              st.energy = static_cast<double> (t.batteryLevel) / 255.0;
+              st.linkQ = 0.0;
+              m_subnetNodeStates[st.nodeId] = st;
+              LogStandardTlvEvent ("HNMP_TLV_HANDLE", NmsTlv::TYPE_TELEMETRY_010,
+                                   "store nodeId=" + std::to_string (st.nodeId) +
+                                   " energy=" + std::to_string (st.energy));
+            }
+        }
+      else if (payloadLen >= 3 && buf[0] == NmsTlv::TYPE_ROLE_011)
+        {
+          std::ostringstream rx;
+          rx << "src=" << src << " bytes=" << payloadLen;
+          LogStandardTlvEvent ("HNMP_TLV_RX", NmsTlv::TYPE_ROLE_011, rx.str ());
+          NmsTlv::Role011 role = {};
+          if (NmsTlv::ParseRole011 (buf, payloadLen, &role) > 0)
+            {
+              LogStandardTlvEvent ("HNMP_TLV_HANDLE", NmsTlv::TYPE_ROLE_011,
+                                   "nodeId=" + std::to_string (static_cast<uint32_t> (role.nodeId)) +
+                                   " roleType=" + std::to_string (static_cast<uint32_t> (role.roleType)) +
+                                   " computeLevel=" + std::to_string (static_cast<uint32_t> (role.computeLevel)));
+              if (m_socket && m_gmcBackhaulAddress != Ipv4Address ("0.0.0.0") && m_gmcBackhaulPort != 0)
                 {
-                  st.neighborIds = std::move (neighborIds);
-                  m_subnetNodeStates[st.nodeId] = std::move (st);
-                  for (uint32_t nid : m_subnetNodeStates[st.nodeId].neighborIds)
+                  uint8_t frameOut[64];
+                  uint32_t frameLen = BuildHnmpFrame (Hnmp::FRAME_REPORT, 1, 0, buf, payloadLen, frameOut, sizeof (frameOut));
+                  if (frameLen > 0)
                     {
-                      uint32_t a = st.nodeId, b = nid;
-                      if (a > b) std::swap (a, b);
-                      m_subnetEdges.insert (std::make_pair (a, b));
+                      m_socket->Send (Create<Packet> (frameOut, frameLen));
+                      NmsPacketParse::LogDataPacket (GetNode ()->GetId (), "SEND", Ipv4Address ("0.0.0.0"), m_gmcBackhaulAddress, 0, m_gmcBackhaulPort, frameOut, frameLen);
+                      LogStandardTlvEvent ("HNMP_TLV_TX", NmsTlv::TYPE_ROLE_011,
+                                           "forward_to_gmc nodeId=" + std::to_string (static_cast<uint32_t> (role.nodeId)));
                     }
                 }
             }
         }
+      else if (payloadLen >= 3 && buf[0] == NmsTlv::TYPE_EXEC_RESULT_015)
+        {
+          std::ostringstream rx;
+          rx << "src=" << src << " bytes=" << payloadLen;
+          LogStandardTlvEvent ("HNMP_TLV_RX", NmsTlv::TYPE_EXEC_RESULT_015, rx.str ());
+          NmsTlv::ExecResult015 result = {};
+          if (NmsTlv::ParseExecResult015 (buf, payloadLen, &result) > 0)
+            {
+              LogStandardTlvEvent ("HNMP_TLV_HANDLE", NmsTlv::TYPE_EXEC_RESULT_015,
+                                   "intentId=" + std::to_string (static_cast<uint32_t> (result.intentId)) +
+                                   " cmdSeq=" + std::to_string (static_cast<uint32_t> (result.cmdSeq)) +
+                                   " execResult=" + std::to_string (static_cast<uint32_t> (result.execResult)) +
+                                   " failReason=" + std::to_string (static_cast<uint32_t> (result.failReason)));
+              IntentExecState& st = m_intentExecStates[result.intentId];
+              if (st.reportedCmdSeqs.insert (result.cmdSeq).second)
+                {
+                  if (result.execResult == 0)
+                    {
+                      st.successCount = static_cast<uint8_t> (st.successCount + 1);
+                    }
+                  else
+                    {
+                      st.failCount = static_cast<uint8_t> (st.failCount + 1);
+                    }
+                }
+              if (st.totalTargets > 0 && st.successCount + st.failCount >= st.totalTargets && m_socket)
+                {
+                  NmsTlv::IntentReport016 report = {};
+                  report.intentId = result.intentId;
+                  report.totalTargets = st.totalTargets;
+                  report.successCount = st.successCount;
+                  report.failCount = st.failCount;
+                  uint8_t tlvOut[64];
+                  uint8_t frameOut[96];
+                  uint32_t tlvLen = NmsTlv::BuildIntentReport016Payload (tlvOut, sizeof (tlvOut), report);
+                  uint32_t frameLen = BuildHnmpFrame (Hnmp::FRAME_REPORT, 1, 0, tlvOut, tlvLen, frameOut, sizeof (frameOut));
+                  if (tlvLen > 0 && frameLen > 0)
+                    {
+                      LogStandardTlvEvent ("HNMP_TLV_BUILD", NmsTlv::TYPE_INTENT_REPORT_016,
+                                           "intentId=" + std::to_string (static_cast<uint32_t> (report.intentId)) +
+                                           " totalTargets=" + std::to_string (static_cast<uint32_t> (report.totalTargets)) +
+                                           " successCount=" + std::to_string (static_cast<uint32_t> (report.successCount)) +
+                                           " failCount=" + std::to_string (static_cast<uint32_t> (report.failCount)));
+                      m_socket->Send (Create<Packet> (frameOut, frameLen));
+                      NmsPacketParse::LogDataPacket (GetNode ()->GetId (), "SEND", Ipv4Address ("0.0.0.0"), m_gmcBackhaulAddress, 0, m_gmcBackhaulPort, frameOut, frameLen);
+                      std::ostringstream tx;
+                      tx << "intentId=" << static_cast<uint32_t> (report.intentId)
+                         << " dst=" << m_gmcBackhaulAddress;
+                      LogStandardTlvEvent ("HNMP_TLV_TX", NmsTlv::TYPE_INTENT_REPORT_016, tx.str ());
+                    }
+                  m_intentExecStates.erase (result.intentId);
+                }
+            }
+        }
+      else if (payloadLen >= 3 && buf[0] == NmsTlv::TYPE_FAULT_040)
+        {
+          std::ostringstream rx;
+          rx << "src=" << src << " bytes=" << payloadLen;
+          LogStandardTlvEvent ("HNMP_TLV_RX", NmsTlv::TYPE_FAULT_040, rx.str ());
+          NmsTlv::Alert040 alert = {};
+          if (NmsTlv::ParseAlert040 (buf, payloadLen, &alert) > 0)
+            {
+              LogStandardTlvEvent ("HNMP_TLV_HANDLE", NmsTlv::TYPE_FAULT_040,
+                                   "reporter=" + std::to_string (static_cast<uint32_t> (alert.reportNodeId)) +
+                                   " target=" + std::to_string (static_cast<uint32_t> (alert.targetNodeId)) +
+                                   " level=" + std::to_string (static_cast<uint32_t> (alert.alertLevel)) +
+                                   " reason=" + std::to_string (static_cast<uint32_t> (alert.alertReason)));
+            }
+          uint8_t frameOut[64];
+          uint32_t frameLen = BuildHnmpFrame (Hnmp::FRAME_ALERT, 1, 0, buf, payloadLen, frameOut, sizeof (frameOut));
+          if (frameLen > 0 && m_socket)
+            {
+              m_socket->Send (Create<Packet> (frameOut, frameLen));
+              NmsPacketParse::LogDataPacket (GetNode ()->GetId (), "SEND", Ipv4Address ("0.0.0.0"), m_gmcBackhaulAddress, 0, m_gmcBackhaulPort, frameOut, frameLen);
+              std::ostringstream tx;
+              tx << "forward_to_gmc dst=" << m_gmcBackhaulAddress;
+              LogStandardTlvEvent ("HNMP_TLV_TX", NmsTlv::TYPE_FAULT_040, tx.str ());
+            }
+        }
+      else if (payloadLen >= 3 && buf[0] == NmsTlv::TYPE_ROUTE_FAIL_041)
+        {
+          std::ostringstream rx;
+          rx << "src=" << src << " bytes=" << payloadLen;
+          LogStandardTlvEvent ("HNMP_TLV_RX", NmsTlv::TYPE_ROUTE_FAIL_041, rx.str ());
+          NmsTlv::RouteFail041 fail = {};
+          if (NmsTlv::ParseRouteFail041 (buf, payloadLen, &fail) > 0)
+            {
+              LogStandardTlvEvent ("HNMP_TLV_HANDLE", NmsTlv::TYPE_ROUTE_FAIL_041,
+                                   "flowId=" + std::to_string (fail.flowId) +
+                                   " faultNodeId=" + std::to_string (static_cast<uint32_t> (fail.faultNodeId)) +
+                                   " failReason=" + std::to_string (static_cast<uint32_t> (fail.failReason)));
+            }
+          uint8_t frameOut[64];
+          uint32_t frameLen = BuildHnmpFrame (Hnmp::FRAME_ALERT, 1, 0, buf, payloadLen, frameOut, sizeof (frameOut));
+          if (frameLen > 0 && m_socket)
+            {
+              m_socket->Send (Create<Packet> (frameOut, frameLen));
+              NmsPacketParse::LogDataPacket (GetNode ()->GetId (), "SEND", Ipv4Address ("0.0.0.0"), m_gmcBackhaulAddress, 0, m_gmcBackhaulPort, frameOut, frameLen);
+              std::ostringstream tx;
+              tx << "forward_to_gmc dst=" << m_gmcBackhaulAddress;
+              LogStandardTlvEvent ("HNMP_TLV_TX", NmsTlv::TYPE_ROUTE_FAIL_041, tx.str ());
+            }
+        }
+
+      // 旧 TYPE_NODE_REPORT_SPN 兼容路径保留，但论文主路径优先使用 0x10/0x15/0x40。
+
     }
 }
 
@@ -3706,14 +4553,77 @@ HeterogeneousNodeApp::RecvPolicy (Ptr<Socket> socket)
           NmsPacketParse::LogPolicyPacket (nodeId, "RECV", iaddr.GetIpv4 (), iaddr.GetPort (), buf.data (), size);
         }
       std::ostringstream oss;
-      oss << "forwarding policy to subnet (size=" << size << "B)";
+      oss << "received policy from GMC (size=" << size << "B)";
       NMS_LOG_INFO (nodeId, "PROXY_POLICY", oss.str ());
+      RefreshPolicyTargetStateCache ();
 
-      if (m_subnetBroadcast != Ipv4Address ("0.0.0.0"))
+      std::vector<uint8_t> payloadBuf;
+      if (size > 0)
         {
-          Ptr<Packet> fwd = packet->Copy ();
-          InetSocketAddress dst = InetSocketAddress (m_subnetBroadcast, m_nodePolicyPort);
-          m_policySocket->SendTo (fwd, 0, dst);
+          std::vector<uint8_t> raw (size);
+          packet->CopyData (raw.data (), size);
+          const uint8_t* payload = nullptr;
+          uint32_t payloadLen = 0;
+          if (ParseHnmpFrame (raw.data (), size, &payload, &payloadLen) && payload && payloadLen >= 3)
+            {
+              NmsTlv::Intent013 intent = {};
+              if (NmsTlv::ParseIntent013 (payload, payloadLen, &intent) > 0)
+                {
+                  NmsTlv::ExecCmd014 cmd = {};
+                  cmd.intentId = intent.intentId;
+                  cmd.cmdSeq = m_nextCmdSeq++;
+                  std::string targetReason;
+                  cmd.targetNodeId = SelectSinglePolicyTargetByIntent (intent.intentType, &targetReason);
+                  if (cmd.targetNodeId == 0xFF)
+                    {
+                      NmsLog ("WARN", nodeId, "PROXY_POLICY", "no eligible policy target for intent="
+                              + std::to_string (intent.intentId)
+                              + " intentType=" + std::to_string (intent.intentType)
+                              + " reason=" + targetReason);
+                      EmitRouteFail041 (intent.intentId, 1, "no_eligible_target", true);
+                      continue;
+                    }
+                  cmd.cmdType = intent.intentType;
+                  cmd.cmdParam = (static_cast<uint32_t> (intent.validTime) << 16) | intent.param1;
+                  uint8_t tlvBuf[64];
+                  uint32_t tlvLen = NmsTlv::BuildExecCmd014Payload (tlvBuf, sizeof (tlvBuf), cmd);
+                  if (tlvLen > 0)
+                    {
+                      payloadBuf.assign (tlvBuf, tlvBuf + tlvLen);
+                      IntentExecState& st = m_intentExecStates[intent.intentId];
+                      st.totalTargets = 1;
+                      st.successCount = 0;
+                      st.failCount = 0;
+                      st.reportedCmdSeqs.clear ();
+                    }
+                }
+            }
+        }
+
+      if (!payloadBuf.empty ())
+        {
+          uint8_t frameBuf[96];
+          uint32_t frameLen = BuildHnmpFrame (Hnmp::FRAME_POLICY, 1, 0xFF, payloadBuf.data (), payloadBuf.size (), frameBuf, sizeof (frameBuf));
+          Ptr<Packet> fwd = Create<Packet> (frameBuf, frameLen);
+          if (m_subnetType == SUBNET_LTE)
+            {
+              NmsTlv::ExecCmd014 cmd = {};
+              if (NmsTlv::ParseExecCmd014 (payloadBuf.data (), payloadBuf.size (), &cmd) > 0)
+                {
+                  Ipv4Address dstAddr = ResolveNodeSubnetAddress (cmd.targetNodeId);
+                  if (dstAddr != Ipv4Address ("0.0.0.0"))
+                    {
+                      m_policySocket->SendTo (fwd, 0, InetSocketAddress (dstAddr, m_nodePolicyPort));
+                      NmsPacketParse::LogDataPacket (nodeId, "SEND", Ipv4Address ("0.0.0.0"), dstAddr, 0, m_nodePolicyPort, frameBuf, frameLen);
+                    }
+                }
+            }
+          else if (m_subnetBroadcast != Ipv4Address ("0.0.0.0"))
+            {
+              InetSocketAddress dst = InetSocketAddress (m_subnetBroadcast, m_nodePolicyPort);
+              m_policySocket->SendTo (fwd, 0, dst);
+              NmsPacketParse::LogDataPacket (nodeId, "SEND", Ipv4Address ("0.0.0.0"), m_subnetBroadcast, 0, m_nodePolicyPort, frameBuf, frameLen);
+            }
         }
     }
 }
@@ -3857,15 +4767,114 @@ HeterogeneousNodeApp::HandlePolicyFromSpn (Ptr<Socket> socket)
     {
       uint32_t nodeId = GetNode ()->GetId ();
       uint32_t size = packet->GetSize ();
+      InetSocketAddress iaddr = InetSocketAddress::ConvertFrom (from);
+      Ipv4Address replyAddr = iaddr.GetIpv4 ();
+
+      std::vector<uint8_t> buf (size);
       if (size > 0)
         {
-          std::vector<uint8_t> buf (size);
           packet->CopyData (buf.data (), size);
-          InetSocketAddress iaddr = InetSocketAddress::ConvertFrom (from);
           NmsPacketParse::LogPolicyPacket (nodeId, "RECV", iaddr.GetIpv4 (), iaddr.GetPort (), buf.data (), size);
         }
+
+      const uint8_t* payload = nullptr;
+      uint32_t payloadLen = 0;
+      if (!ParseHnmpFrame (buf.data (), size, &payload, &payloadLen) || !payload || payloadLen < 3)
+        {
+          NMS_LOG_WARN (nodeId, "POLICY_EXEC", "node=" + std::to_string (nodeId)
+                        + " action=PARSE_FRAME old=0 new=0 success=0 err="
+                        + std::to_string (static_cast<uint32_t> (EXEC_ERR_INTERNAL))
+                        + " msg=ParseHnmpFrame_failed");
+          continue;
+        }
+
+      NmsTlv::ExecCmd014 cmd = {};
+      if (NmsTlv::ParseExecCmd014 (payload, payloadLen, &cmd) == 0)
+        {
+          NMS_LOG_WARN (nodeId, "POLICY_EXEC", "node=" + std::to_string (nodeId)
+                        + " action=PARSE_CMD014 old=0 new=0 success=0 err="
+                        + std::to_string (static_cast<uint32_t> (EXEC_ERR_INTERNAL))
+                        + " msg=ParseExecCmd014_failed");
+          EmitRouteFail041 (0, 2, "parse_cmd014_failed", false);
+          continue;
+        }
+
+      // 仅目标节点执行；非目标节点忽略
+      if (cmd.targetNodeId != 0xFF && cmd.targetNodeId != static_cast<uint8_t> (nodeId & 0xffu))
+        {
+          continue;
+        }
+
+      // 1) 将现有 0x14 命令映射为 TSN 本地动作
+      PolicyAction action = m_intentMapper.Map (cmd);
+
+      // 2) 调用真实执行层
+      ExecStatus execStatus;
+      if (!action.valid)
+        {
+          execStatus.success = false;
+          execStatus.errorCode = EXEC_ERR_UNSUPPORTED_ACTION;
+          execStatus.oldValue = 0.0;
+          execStatus.newValue = 0.0;
+          execStatus.message = "intent_map_invalid";
+        }
+      else
+        {
+          execStatus = m_policyExecutor.Execute (action);
+        }
+
+      // 3) 基于真实执行结果构造 0x15，而不是固定成功
+      NmsTlv::ExecResult015 result = {};
+      result.intentId = cmd.intentId;
+      result.cmdSeq = cmd.cmdSeq;
+      result.execResult = execStatus.success ? 0 : 1;
+      result.failReason = execStatus.errorCode;
+
+      uint8_t tlvBuf[32];
+      uint8_t frameBuf[64];
+      uint32_t tlvLen = NmsTlv::BuildExecResult015Payload (tlvBuf, sizeof (tlvBuf), result);
+      uint32_t frameLen = BuildHnmpFrame (Hnmp::FRAME_REPORT, 1, 0, tlvBuf, tlvLen, frameBuf, sizeof (frameBuf));
+      if (tlvLen > 0 && frameLen > 0 && m_socket)
+        {
+          LogStandardTlvEvent ("HNMP_TLV_BUILD", NmsTlv::TYPE_EXEC_RESULT_015,
+                               "intentId=" + std::to_string (static_cast<uint32_t> (result.intentId)) +
+                               " cmdSeq=" + std::to_string (static_cast<uint32_t> (result.cmdSeq)) +
+                               " execResult=" + std::to_string (static_cast<uint32_t> (result.execResult)) +
+                               " failReason=" + std::to_string (static_cast<uint32_t> (result.failReason)));
+          m_socket->SendTo (Create<Packet> (frameBuf, frameLen), 0,
+                            InetSocketAddress (replyAddr, m_subnetReportPort));
+          NmsPacketParse::LogDataPacket (nodeId, "SEND", Ipv4Address ("0.0.0.0"), replyAddr, 0,
+                                         m_subnetReportPort, frameBuf, frameLen);
+          std::ostringstream tx;
+          tx << "dst=" << replyAddr << ":" << m_subnetReportPort;
+          LogStandardTlvEvent ("HNMP_TLV_TX", NmsTlv::TYPE_EXEC_RESULT_015, tx.str ());
+        }
+
+      // 4) oldValue/newValue/actionType 暂仅写日志，不扩展现有 0x15 序列化
+      const char* actionStr = "NONE";
+      if (action.actionType == ACTION_TX_POWER)
+        {
+          actionStr = "TX_POWER";
+        }
+
+      std::ostringstream execOss;
+      execOss << "node=" << nodeId
+              << " action=" << actionStr
+              << " old=" << execStatus.oldValue
+              << " new=" << execStatus.newValue
+              << " success=" << (execStatus.success ? 1 : 0)
+              << " err=" << static_cast<uint32_t> (execStatus.errorCode)
+              << " msg=" << execStatus.message
+              << " intentId=" << static_cast<uint32_t> (cmd.intentId)
+              << " cmdSeq=" << static_cast<uint32_t> (cmd.cmdSeq)
+              << " target=" << static_cast<uint32_t> (cmd.targetNodeId);
+      NMS_LOG_INFO (nodeId, "POLICY_EXEC", execOss.str ());
+
       std::ostringstream oss;
-      oss << "received policy from SPN, size=" << packet->GetSize () << "B";
+      oss << "executed cmd intent=" << static_cast<uint32_t> (cmd.intentId)
+          << " cmdSeq=" << static_cast<uint32_t> (cmd.cmdSeq)
+          << " execResult=" << static_cast<uint32_t> (result.execResult)
+          << " failReason=" << static_cast<uint32_t> (result.failReason);
       NMS_LOG_INFO (nodeId, "PROXY_POLICY", oss.str ());
     }
 }
@@ -3884,8 +4893,14 @@ HeterogeneousNodeApp::StartApplication (void)
       m_socketBoundPeerPort = m_peerPort;
     }
 
-  // SPN（Adhoc/DataLink）：在 reportPort 收子网上报，在 spnPolicyPort 收 GMC 策略；所有节点先创建 Socket，当选为 SPN 后再调度 Flush
-  if (m_subnetType == SUBNET_ADHOC || m_subnetType == SUBNET_DATALINK)
+  // 初始化 TSN 节点侧真实策略执行器
+  m_policyExecutor.SetNode (GetNode ());
+  m_policyExecutor.SetSubnetLabel (GetNodeSubnetType (GetNode ()->GetId ()));
+
+  // SPN（Adhoc/DataLink/LTE）：在 reportPort 收子网上报，在 spnPolicyPort 收 GMC 策略；
+  // Adhoc/DataLink 需在启动时就创建，因其 SPN 角色是运行期动态切换；LTE 仅固定 eNB 创建。
+  if (m_subnetType == SUBNET_ADHOC || m_subnetType == SUBNET_DATALINK ||
+      (m_subnetType == SUBNET_LTE && m_isSpn))
     {
       if (!m_aggregateSocket)
         {
@@ -3896,16 +4911,19 @@ HeterogeneousNodeApp::StartApplication (void)
       if (!m_policySocket)
         {
           m_policySocket = Socket::CreateSocket (GetNode (), UdpSocketFactory::GetTypeId ());
+          m_policySocket->SetAllowBroadcast (true);
           m_policySocket->Bind (InetSocketAddress (Ipv4Address::GetAny (), m_spnPolicyPort));
           m_policySocket->SetRecvCallback (MakeCallback (&HeterogeneousNodeApp::RecvPolicy, this));
         }
       if (m_isSpn)
-        m_flushEvent = Simulator::Schedule (m_aggregateInterval,
-                                            &HeterogeneousNodeApp::FlushAggregatedToGmc, this);
+        {
+          m_flushEvent = Simulator::Schedule (m_aggregateInterval,
+                                              &HeterogeneousNodeApp::FlushAggregatedToGmc, this);
+        }
     }
 
-  // 非 SPN（Adhoc/DataLink）：在 5003 接收 SPN 转发的策略
-  if (!m_isSpn && (m_subnetType == SUBNET_ADHOC || m_subnetType == SUBNET_DATALINK))
+  // 非 SPN（Adhoc/DataLink/LTE）：在 nodePolicyPort 接收 SPN 转发的策略
+  if (!m_isSpn && (m_subnetType == SUBNET_ADHOC || m_subnetType == SUBNET_DATALINK || m_subnetType == SUBNET_LTE))
     {
       if (!m_policyRecvSocket)
         {
@@ -3960,6 +4978,8 @@ HeterogeneousNodeApp::StartApplication (void)
       return;
     }
   // 启动时立即发第一包或根据需要延时
+  m_lastRoleTypeCode = GetRoleTypeCode (m_isSpn, m_isBackupSpn);
+  EmitRoleStatus011 ("app_start", m_isSpn);
   SendPacket ();
 }
 
@@ -4042,6 +5062,45 @@ void
 HeterogeneousNodeApp::ForceFail ()
 {
   uint32_t nodeId = GetNode ()->GetId ();
+  if (m_socket)
+    {
+      NmsTlv::Alert040 alert = {};
+      alert.reportNodeId = static_cast<uint8_t> (nodeId & 0xffu);
+      alert.targetNodeId = static_cast<uint8_t> (nodeId & 0xffu);
+      alert.alertLevel = 2;
+      alert.alertReason = 1;
+      uint8_t tlvBuf[32];
+      uint8_t frameBuf[64];
+      uint32_t tlvLen = NmsTlv::BuildAlert040Payload (tlvBuf, sizeof (tlvBuf), alert);
+      uint32_t frameLen = BuildHnmpFrame (Hnmp::FRAME_ALERT, 1, 0, tlvBuf, tlvLen, frameBuf, sizeof (frameBuf));
+      if (tlvLen > 0 && frameLen > 0)
+        {
+          LogStandardTlvEvent ("HNMP_TLV_BUILD", NmsTlv::TYPE_FAULT_040,
+                               "reporter=" + std::to_string (static_cast<uint32_t> (alert.reportNodeId)) +
+                               " target=" + std::to_string (static_cast<uint32_t> (alert.targetNodeId)) +
+                               " level=" + std::to_string (static_cast<uint32_t> (alert.alertLevel)) +
+                               " reason=" + std::to_string (static_cast<uint32_t> (alert.alertReason)));
+          Ipv4Address dstAddr = m_reportTargetAddress != Ipv4Address ("0.0.0.0") ? m_reportTargetAddress
+                              : (m_gmcBackhaulAddress != Ipv4Address ("0.0.0.0") ? m_gmcBackhaulAddress : m_peerAddress);
+          uint16_t dstPort = m_reportTargetAddress != Ipv4Address ("0.0.0.0") ? m_subnetReportPort
+                            : (m_gmcBackhaulPort != 0 ? m_gmcBackhaulPort : m_peerPort);
+          {
+            std::ostringstream route;
+            route << "node=" << nodeId
+                  << " isSpn=" << (m_isSpn ? 1 : 0)
+                  << " reportTarget=" << m_reportTargetAddress
+                  << " gmcBackhaul=" << m_gmcBackhaulAddress << ":" << m_gmcBackhaulPort
+                  << " peer=" << m_peerAddress << ":" << m_peerPort
+                  << " selectedDst=" << dstAddr << ":" << dstPort;
+            NMS_LOG_INFO (nodeId, "FORCE_FAIL_ROUTE", route.str ());
+          }
+          m_socket->Send (Create<Packet> (frameBuf, frameLen));
+          NmsPacketParse::LogDataPacket (nodeId, "SEND", Ipv4Address ("0.0.0.0"), dstAddr, 0, dstPort, frameBuf, frameLen);
+          std::ostringstream tx;
+          tx << "dst=" << dstAddr << ":" << dstPort;
+          LogStandardTlvEvent ("HNMP_TLV_TX", NmsTlv::TYPE_FAULT_040, tx.str ());
+        }
+    }
   m_uvMib.m_energy = 0.0;
   NMS_LOG_INFO (nodeId, "NODE_OFFLINE", "Node " + std::to_string (nodeId) + " application stopped (OFFLINE)");
   StopApplication ();
@@ -4334,31 +5393,37 @@ HeterogeneousNodeApp::SendPacket ()
     {
       if (!m_isSpn && m_reportTargetAddress != Ipv4Address ("0.0.0.0"))
         {
-          double px = 0.0, py = 0.0, pz = 0.0;
-          float vx = 0.0f, vy = 0.0f, vz = 0.0f;
+          NmsTlv::Telemetry010 telemetry = {};
+          telemetry.nodeId = static_cast<uint8_t> (nodeId & 0xffu);
+          telemetry.batteryLevel = static_cast<uint8_t> (std::max (0.0, std::min (255.0, std::round (m_uvMib.m_energy * 255.0))));
           Ptr<MobilityModel> mob = GetNode ()->GetObject<MobilityModel> ();
           if (mob)
             {
               Vector pos = mob->GetPosition ();
-              px = pos.x; py = pos.y; pz = pos.z;
-              Ptr<ConstantVelocityMobilityModel> cv = DynamicCast<ConstantVelocityMobilityModel> (mob);
-              if (cv)
-                {
-                  Vector vel = cv->GetVelocity ();
-                  vx = static_cast<float> (vel.x); vy = static_cast<float> (vel.y); vz = static_cast<float> (vel.z);
-                }
+              telemetry.posX = static_cast<float> (pos.x);
+              telemetry.posY = static_cast<float> (pos.y);
+              telemetry.posZ = static_cast<float> (pos.z);
+              Vector vel = mob->GetVelocity ();
+              telemetry.vx = static_cast<float> (vel.x);
+              telemetry.vy = static_cast<float> (vel.y);
+              telemetry.vz = static_cast<float> (vel.z);
             }
-          std::vector<uint32_t> neighborIds;
-          for (const auto& kv : m_neighborScores)
-            neighborIds.push_back (kv.first);
-          tlvLen = NmsTlv::BuildNodeReportSpnPayload (tlvBuf, sizeof (tlvBuf),
-                                                      nodeId, px, py, pz, vx, vy, vz,
-                                                      m_uvMib.m_energy, m_uvMib.m_linkQuality,
-                                                      neighborIds);
+          tlvLen = NmsTlv::BuildTelemetry010Payload (tlvBuf, sizeof (tlvBuf), telemetry);
           if (tlvLen > 0)
             {
+              {
+                std::ostringstream tlvOss;
+                tlvOss << "reason=telemetry_periodic nodeId=" << static_cast<uint32_t> (telemetry.nodeId)
+                       << " batteryLevel=" << static_cast<uint32_t> (telemetry.batteryLevel);
+                LogStandardTlvEvent ("HNMP_TLV_BUILD", NmsTlv::TYPE_TELEMETRY_010, tlvOss.str ());
+              }
               sendHnmp (tlvBuf, tlvLen, 1, 0xFE);
-              NMS_LOG_INFO (nodeId, "SEND", "Ad-hoc NODE_REPORT_SPN to SPN Size=" + std::to_string (tlvLen) + "B");
+              {
+                std::ostringstream tlvOss;
+                tlvOss << "reason=telemetry_periodic dst=" << m_reportTargetAddress << ":" << m_subnetReportPort;
+                LogStandardTlvEvent ("HNMP_TLV_TX", NmsTlv::TYPE_TELEMETRY_010, tlvOss.str ());
+              }
+              NMS_LOG_INFO (nodeId, "SEND", "Ad-hoc Telemetry010 to SPN Size=" + std::to_string (tlvLen) + "B");
             }
         }
       else if (!m_isSpn)
@@ -4390,31 +5455,58 @@ HeterogeneousNodeApp::SendPacket ()
     {
       if (!m_isSpn && m_reportTargetAddress != Ipv4Address ("0.0.0.0"))
         {
-          double px = 0.0, py = 0.0, pz = 0.0;
-          float vx = 0.0f, vy = 0.0f, vz = 0.0f;
-          Ptr<MobilityModel> mob = GetNode ()->GetObject<MobilityModel> ();
-          if (mob)
+          if (suppressedByWindow ())
             {
-              Vector pos = mob->GetPosition ();
-              px = pos.x; py = pos.y; pz = pos.z;
-              Ptr<ConstantVelocityMobilityModel> cv = DynamicCast<ConstantVelocityMobilityModel> (mob);
-              if (cv)
+              NMS_LOG_INFO (nodeId, "DECISION", "action=TRIGGER reason=BYPASS_SUPPRESS_BY_SCHEDULER");
+            }
+
+          double delta = std::fabs (m_uvMib.m_energy - m_uvMib.m_lastReportedEnergy);
+          if (delta >= m_energyDeltaThreshold)
+            {
+              NmsTlv::Telemetry010 telemetry = {};
+              telemetry.nodeId = static_cast<uint8_t> (nodeId & 0xffu);
+              telemetry.batteryLevel = static_cast<uint8_t> (std::max (0.0, std::min (255.0, std::round (m_uvMib.m_energy * 255.0))));
+              Ptr<MobilityModel> mob = GetNode ()->GetObject<MobilityModel> ();
+              if (mob)
                 {
-                  Vector vel = cv->GetVelocity ();
-                  vx = static_cast<float> (vel.x); vy = static_cast<float> (vel.y); vz = static_cast<float> (vel.z);
+                  Vector pos = mob->GetPosition ();
+                  telemetry.posX = static_cast<float> (pos.x);
+                  telemetry.posY = static_cast<float> (pos.y);
+                  telemetry.posZ = static_cast<float> (pos.z);
+                  Vector vel = mob->GetVelocity ();
+                  telemetry.vx = static_cast<float> (vel.x);
+                  telemetry.vy = static_cast<float> (vel.y);
+                  telemetry.vz = static_cast<float> (vel.z);
+                }
+              tlvLen = NmsTlv::BuildTelemetry010Payload (tlvBuf, sizeof (tlvBuf), telemetry);
+              if (tlvLen > 0)
+                {
+                  {
+                    std::ostringstream tlvOss;
+                    tlvOss << "reason=datalink_delta nodeId=" << static_cast<uint32_t> (telemetry.nodeId)
+                           << " batteryLevel=" << static_cast<uint32_t> (telemetry.batteryLevel);
+                    LogStandardTlvEvent ("HNMP_TLV_BUILD", NmsTlv::TYPE_TELEMETRY_010, tlvOss.str ());
+                  }
+                  sendHnmp (tlvBuf, tlvLen, 0, 0xFE);
+                  {
+                    std::ostringstream tlvOss;
+                    tlvOss << "reason=datalink_delta dst=" << m_reportTargetAddress << ":" << m_subnetReportPort;
+                    LogStandardTlvEvent ("HNMP_TLV_TX", NmsTlv::TYPE_TELEMETRY_010, tlvOss.str ());
+                  }
+                  m_uvMib.m_lastReportedEnergy = m_uvMib.m_energy;
+                  markReported ();
+                  NMS_LOG_INFO (nodeId, "DELTA_REPORT",
+                                "energy delta=" + std::to_string (delta) +
+                                " threshold=" + std::to_string (m_energyDeltaThreshold));
+                  NMS_LOG_INFO (nodeId, "SEND", "DataLink Telemetry010 to SPN Size=" + std::to_string (tlvLen) + "B");
                 }
             }
-          std::vector<uint32_t> neighborIds;
-          for (const auto& kv : m_neighborScores)
-            neighborIds.push_back (kv.first);
-          tlvLen = NmsTlv::BuildNodeReportSpnPayload (tlvBuf, sizeof (tlvBuf),
-                                                      nodeId, px, py, pz, vx, vy, vz,
-                                                      m_uvMib.m_energy, m_uvMib.m_linkQuality,
-                                                      neighborIds);
-          if (tlvLen > 0)
+          else
             {
-              sendHnmp (tlvBuf, tlvLen, 0, 0xFE);
-              NMS_LOG_INFO (nodeId, "SEND", "DataLink NODE_REPORT_SPN to SPN Size=" + std::to_string (tlvLen) + "B");
+              m_protocolSuppressCount++;
+              NMS_LOG_INFO (nodeId, "DELTA_SUPPRESS",
+                            "energy delta=" + std::to_string (delta) +
+                            " below threshold=" + std::to_string (m_energyDeltaThreshold));
             }
         }
       else if (!m_isSpn)
@@ -4494,7 +5586,7 @@ class GmcPolicySenderApp : public Application
 public:
   GmcPolicySenderApp ();
   virtual ~GmcPolicySenderApp ();
-  void AddTarget (Ipv4Address addr, uint16_t port);
+  void AddTarget (HeterogeneousNodeApp::SubnetType subnetType, uint32_t nodeId, Ipv4Address addr, uint16_t port);
   void SetInterval (Time interval);
 
 protected:
@@ -4505,17 +5597,26 @@ protected:
 private:
   void SendPolicy ();
 
-  std::vector<std::pair<Ipv4Address, uint16_t>> m_targets;
+  struct TargetEntry
+  {
+    HeterogeneousNodeApp::SubnetType subnetType;
+    uint32_t nodeId;
+    Ipv4Address addr;
+    uint16_t port;
+  };
+  std::vector<TargetEntry> m_targets;
   Time            m_interval;
   EventId         m_sendEvent;
   Ptr<Socket>     m_socket;
   bool            m_running;
+  uint8_t         m_nextIntentId;
 };
 
 GmcPolicySenderApp::GmcPolicySenderApp ()
   : m_interval (Seconds (10.0)),
     m_socket (0),
-    m_running (false)
+    m_running (false),
+    m_nextIntentId (1)
 {
 }
 
@@ -4525,9 +5626,9 @@ GmcPolicySenderApp::~GmcPolicySenderApp ()
 }
 
 void
-GmcPolicySenderApp::AddTarget (Ipv4Address addr, uint16_t port)
+GmcPolicySenderApp::AddTarget (HeterogeneousNodeApp::SubnetType subnetType, uint32_t nodeId, Ipv4Address addr, uint16_t port)
 {
-  m_targets.push_back (std::make_pair (addr, port));
+  m_targets.push_back (TargetEntry{subnetType, nodeId, addr, port});
 }
 
 void
@@ -4572,16 +5673,77 @@ GmcPolicySenderApp::SendPolicy (void)
       return;
     }
 
-  uint8_t buf[64];
-  uint32_t len = NmsTlv::BuildPolicyPayload (buf, 32);
-  Ptr<Packet> pkt = Create<Packet> (buf, len);
-
+  std::vector<TargetEntry> actualTargets;
+  std::set<std::pair<int, uint32_t>> seen;
   for (const auto& t : m_targets)
     {
-      m_socket->SendTo (pkt->Copy (), 0, InetSocketAddress (t.first, t.second));
+      uint32_t primaryId = HeterogeneousNodeApp::GetCurrentPrimaryIdForSubnet (t.subnetType);
+      if (primaryId == 0 || primaryId != t.nodeId)
+        {
+          continue;
+        }
+      std::pair<int, uint32_t> key (static_cast<int> (t.subnetType), t.nodeId);
+      if (seen.insert (key).second)
+        {
+          actualTargets.push_back (t);
+        }
+    }
+  if (actualTargets.empty ())
+    {
+      NmsLog ("WARN", GetNode ()->GetId (), "POLICY_FORWARD", "no committed primary SPN yet, skip 0x13 send");
+      m_sendEvent = Simulator::Schedule (m_interval, &GmcPolicySenderApp::SendPolicy, this);
+      return;
     }
 
-  NmsLog ("INFO", GetNode ()->GetId (), "POLICY_FORWARD", "policy sent to all SPNs");
+  NmsTlv::Intent013 intent = {};
+  intent.intentId = m_nextIntentId++;
+  intent.intentType = 1;
+  intent.validTime = 30;
+  intent.param1 = 100;
+  intent.param2 = 1;
+
+  uint8_t tlvBuf[64];
+  uint8_t frameBuf[96];
+  uint32_t tlvLen = NmsTlv::BuildIntent013Payload (tlvBuf, sizeof (tlvBuf), intent);
+  Hnmp::Header h = {};
+  h.frameType = Hnmp::FRAME_RESPONSE;
+  h.qosLevel = 1;
+  h.sourceId = static_cast<uint8_t> (GetNode ()->GetId () & 0xffu);
+  h.destId = 0xffu;
+  h.seq = intent.intentId;
+  h.payloadLen = static_cast<uint8_t> (std::min (tlvLen, 255u));
+  uint32_t frameLen = Hnmp::EncodeFrame (frameBuf, sizeof (frameBuf), h, tlvBuf, h.payloadLen, false);
+  if (tlvLen == 0 || frameLen == 0)
+    {
+      m_sendEvent = Simulator::Schedule (m_interval, &GmcPolicySenderApp::SendPolicy, this);
+      return;
+    }
+
+  std::ostringstream targetOss;
+  bool firstTarget = true;
+  for (const auto& t : actualTargets)
+    {
+      m_socket->SendTo (Create<Packet> (frameBuf, frameLen), 0, InetSocketAddress (t.addr, t.port));
+      NmsPacketParse::LogDataPacket (GetNode ()->GetId (), "SEND", Ipv4Address ("0.0.0.0"), t.addr, 0, t.port, frameBuf, frameLen);
+      if (!firstTarget)
+        {
+          targetOss << ", ";
+        }
+      firstTarget = false;
+      targetOss << "[subnet=" << static_cast<uint32_t> (t.subnetType)
+                << ", nodeId=" << t.nodeId
+                << ", addr=" << t.addr
+                << ", port=" << t.port << "]";
+    }
+
+  std::ostringstream oss;
+  oss << "intent sent to current primary SPN IntentID=" << static_cast<uint32_t> (intent.intentId)
+      << " IntentType=" << static_cast<uint32_t> (intent.intentType)
+      << " ValidTime=" << intent.validTime
+      << " Param1=" << intent.param1
+      << " Param2=" << static_cast<uint32_t> (intent.param2)
+      << " Targets=" << targetOss.str ();
+  NmsLog ("INFO", GetNode ()->GetId (), "POLICY_FORWARD", oss.str ());
 
   m_sendEvent = Simulator::Schedule (m_interval, &GmcPolicySenderApp::SendPolicy, this);
 }
@@ -4753,6 +5915,7 @@ private:
   void ApplyAdhocRoutingAdaptiveParams ();
   void ApplyOlsrRuntimeParamsToAdhoc (double helloSec, double tcSec);
   void MaybeUpdateRuntimeRouteAdapt (double avgLossPct, double avgDelayMs, uint32_t zeroThroughputFlows, double nowSec);
+  void RecvAtGmc (Ptr<Socket> socket);
 
 private:
   // 全局管理中心
@@ -4779,13 +5942,15 @@ private:
   NetDeviceContainer m_adhocDevs;    ///< Ad-hoc 子网 WiFi 设备（用于 pcap）
   NetDeviceContainer m_datalinkDevs; ///< DataLink 子网 WiFi 设备（用于 pcap）
 
-  // 回程链路设备（GMC 与各 SPN 之间）；LTE 仍为单条，Adhoc/DataLink 改为每条节点一条（动态 SPN）
+  // 回程链路设备（GMC 与各 SPN 之间）；LTE 额外补 eNB<->UE 控制回程，Adhoc/DataLink 为每节点一条动态回程
   NetDeviceContainer m_p2pGmcToLteSpn;
+  std::vector<NetDeviceContainer> m_p2pLteEnbToUeBackhaul;    ///< 每条 LTE eNB-UE 控制回程
   std::vector<NetDeviceContainer> m_p2pGmcToAdhocBackhaul;   ///< 每条 GMC-Adhoc[i] 回程
   std::vector<NetDeviceContainer> m_p2pGmcToDatalinkBackhaul;
 
   // IP 地址分配
   Ipv4InterfaceContainer m_ifGmcLteSpn;
+  std::vector<Ipv4InterfaceContainer> m_ifLteEnbToUeBackhaul;
   Ipv4InterfaceContainer m_ifGmcAdhocSpn;       ///< 保留兼容，取第一条 Adhoc 回程的地址
   Ipv4InterfaceContainer m_ifGmcDatalinkSpn;    ///< 保留兼容
   std::vector<Ipv4InterfaceContainer> m_ifGmcAdhocBackhaul;    ///< 每个 Adhoc 节点一条回程的接口
@@ -4852,6 +6017,7 @@ private:
   };
   std::map<uint32_t, FlowWindowSnapshot> m_flowWindowPrev; ///< FlowMonitor flowId -> 上一窗口快照
   double m_flowPerfWindowSec; ///< 窗口统计周期（秒）
+  Ptr<Socket> m_gmcRecvSocket; ///< GMC 协议级接收 socket（用于 0x11/0x16/0x40/0x41 RX/HANDLE 证据）
 
   /// NODE_ENERGY_FAIL / LINK_INTERFERENCE_FAIL：周期监测（每 1s）
   enum class PhysicsWatchKind
@@ -4921,6 +6087,7 @@ HeterogeneousNmsFramework::HeterogeneousNmsFramework ()
     m_datalinkPacketSize (200),
     m_datalinkIntervalSec (0.5),
     m_flowPerfWindowSec (0.5),
+    m_gmcRecvSocket (0),
     m_failNodeId (0),
     m_failTime (30.0),
     m_spnElectionTimeoutSec (2.0),
@@ -5639,6 +6806,124 @@ HeterogeneousNmsFramework::StopFlowsRelatedToNode (uint32_t nodeId)
 }
 
 void
+HeterogeneousNmsFramework::RecvAtGmc (Ptr<Socket> socket)
+{
+  Address from;
+  Ptr<Packet> packet;
+  while ((packet = socket->RecvFrom (from)))
+    {
+      InetSocketAddress iaddr = InetSocketAddress::ConvertFrom (from);
+      Ipv4Address src = iaddr.GetIpv4 ();
+      uint32_t len = packet->GetSize ();
+      if (len == 0)
+        {
+          continue;
+        }
+      std::vector<uint8_t> data (len);
+      packet->CopyData (data.data (), len);
+      const uint8_t* payload = nullptr;
+      uint32_t payloadLen = 0;
+      Hnmp::Header h = {};
+      if (len >= 6)
+        {
+          uint8_t pLen = data[5];
+          if (len == 6u + pLen && Hnmp::DecodeFrame (data.data (), len, false, &h, &payload, &payloadLen))
+            {
+            }
+          else if (len >= 3)
+            {
+              uint8_t legacyLen = data[2];
+              if (!(len == 3u + legacyLen && Hnmp::DecodeFrame (data.data (), len, true, &h, &payload, &payloadLen)))
+                {
+                  payload = data.data ();
+                  payloadLen = len;
+                }
+            }
+        }
+      else
+        {
+          payload = data.data ();
+          payloadLen = len;
+        }
+      if (!payload || payloadLen < 3)
+        {
+          continue;
+        }
+      NmsPacketParse::LogDataPacket (0, "RECV", src, Ipv4Address ("0.0.0.0"), iaddr.GetPort (), 8080, payload, payloadLen);
+      uint8_t type = payload[0];
+      auto logRx = [&] (uint8_t tlvType) {
+        std::ostringstream rx;
+        rx << "src=" << src << " bytes=" << payloadLen;
+        NmsLog ("INFO", 0, "HNMP_TLV_RX",
+                "stage=HNMP_TLV_RX type=0x" + [&](){ std::ostringstream s; s << std::hex << std::setw (2) << std::setfill ('0') << static_cast<uint32_t> (tlvType); return s.str(); }()
+                + " node=0 " + rx.str ());
+      };
+      auto logHandle = [&] (uint8_t tlvType, const std::string& details) {
+        std::ostringstream tag;
+        tag << "stage=HNMP_TLV_HANDLE type=0x" << std::hex << std::setw (2) << std::setfill ('0')
+            << static_cast<uint32_t> (tlvType) << std::dec << " node=0 " << details;
+        NmsLog ("INFO", 0, "HNMP_TLV_HANDLE", tag.str ());
+      };
+      if (type == NmsTlv::TYPE_ROLE_011)
+        {
+          logRx (type);
+          NmsTlv::Role011 role = {};
+          if (NmsTlv::ParseRole011 (payload, payloadLen, &role) > 0)
+            {
+              logHandle (type, "nodeId=" + std::to_string (static_cast<uint32_t> (role.nodeId))
+                               + " roleType=" + std::to_string (static_cast<uint32_t> (role.roleType))
+                               + " computeLevel=" + std::to_string (static_cast<uint32_t> (role.computeLevel)));
+            }
+        }
+      else if (type == NmsTlv::TYPE_INTENT_REPORT_016)
+        {
+          logRx (type);
+          NmsTlv::IntentReport016 report = {};
+          if (NmsTlv::ParseIntentReport016 (payload, payloadLen, &report) > 0)
+            {
+              logHandle (type, "intentId=" + std::to_string (static_cast<uint32_t> (report.intentId))
+                               + " totalTargets=" + std::to_string (static_cast<uint32_t> (report.totalTargets))
+                               + " successCount=" + std::to_string (static_cast<uint32_t> (report.successCount))
+                               + " failCount=" + std::to_string (static_cast<uint32_t> (report.failCount)));
+            }
+        }
+      else if (type == NmsTlv::TYPE_FAULT_040)
+        {
+          logRx (type);
+          NmsTlv::Alert040 alert = {};
+          if (NmsTlv::ParseAlert040 (payload, payloadLen, &alert) > 0)
+            {
+              logHandle (type, "reporter=" + std::to_string (static_cast<uint32_t> (alert.reportNodeId))
+                               + " target=" + std::to_string (static_cast<uint32_t> (alert.targetNodeId))
+                               + " level=" + std::to_string (static_cast<uint32_t> (alert.alertLevel))
+                               + " reason=" + std::to_string (static_cast<uint32_t> (alert.alertReason)));
+            }
+        }
+      else if (type == NmsTlv::TYPE_ROUTE_FAIL_041)
+        {
+          logRx (type);
+          NmsTlv::RouteFail041 fail = {};
+          if (NmsTlv::ParseRouteFail041 (payload, payloadLen, &fail) > 0)
+            {
+              logHandle (type, "flowId=" + std::to_string (static_cast<uint32_t> (fail.flowId))
+                               + " faultNodeId=" + std::to_string (static_cast<uint32_t> (fail.faultNodeId))
+                               + " failReason=" + std::to_string (static_cast<uint32_t> (fail.failReason)));
+            }
+        }
+      else if (type == NmsTlv::TYPE_TELEMETRY_010)
+        {
+          logRx (type);
+          NmsTlv::Telemetry010 t = {};
+          if (NmsTlv::ParseTelemetry010 (payload, payloadLen, &t) > 0)
+            {
+              logHandle (type, "nodeId=" + std::to_string (static_cast<uint32_t> (t.nodeId))
+                               + " batteryLevel=" + std::to_string (static_cast<uint32_t> (t.batteryLevel)));
+            }
+        }
+    }
+}
+
+void
 HeterogeneousNmsFramework::BuildGmc ()
 {
   m_gmcNode.Create (1);
@@ -6251,6 +7536,20 @@ HeterogeneousNmsFramework::SetupBackhaul ()
     m_ifGmcLteSpn = ipv4.Assign (devices);
   }
 
+  // ========== LTE eNB <-> 每个 UE 一条控制回程（仅用于管理闭环，避免直接依赖 EPC 路由） ==========
+  m_p2pLteEnbToUeBackhaul.clear ();
+  m_ifLteEnbToUeBackhaul.clear ();
+  for (uint32_t i = 0; i < m_lteUeNodes.GetN (); ++i)
+    {
+      NetDeviceContainer devices = p2p.Install (m_lteEnbNodes.Get (0), m_lteUeNodes.Get (i));
+      m_p2pLteEnbToUeBackhaul.push_back (devices);
+      std::ostringstream base;
+      base << "10.103." << i << ".0";
+      ipv4.SetBase (base.str ().c_str (), "255.255.255.0");
+      Ipv4InterfaceContainer ifaces = ipv4.Assign (devices);
+      m_ifLteEnbToUeBackhaul.push_back (ifaces);
+    }
+
   // ========== GMC <-> 每个 Adhoc 节点一条回程（动态 SPN：任一节点都可能成为 SPN 并激活此链路） ==========
   m_p2pGmcToAdhocBackhaul.clear ();
   m_ifGmcAdhocBackhaul.clear ();
@@ -6392,22 +7691,37 @@ HeterogeneousNmsFramework::InstallApplications ()
 
   Time simTime = Seconds (m_simTimeSeconds);
 
-  // 在 GMC 部署 UDP Sink，接收所有子网发来的数据报文（单通道 5000，双通道 9999）
+  // 在 GMC 部署协议级 UDP 接收端，接收所有子网发来的 HNMP 数据报文并产生日志证据
   {
-    Address sinkLocalAddress (InetSocketAddress (Ipv4Address::GetAny (), gmcDataPort));
-    PacketSinkHelper sinkHelper ("ns3::UdpSocketFactory", sinkLocalAddress);
-    ApplicationContainer sinkApps = sinkHelper.Install (m_gmcNode.Get (0));
-    sinkApps.Start (Seconds (0.0));
-    sinkApps.Stop (simTime);
+    m_gmcRecvSocket = Socket::CreateSocket (m_gmcNode.Get (0), UdpSocketFactory::GetTypeId ());
+    m_gmcRecvSocket->Bind (InetSocketAddress (Ipv4Address::GetAny (), gmcDataPort));
+    m_gmcRecvSocket->SetRecvCallback (MakeCallback (&HeterogeneousNmsFramework::RecvAtGmc, this));
   }
 
-  // GMC 策略下发：向所有可能成为 SPN 的节点回程地址发送（动态 SPN 时任一 Adhoc/DataLink 节点都可能接收）
+  // GMC 策略下发：真实 SPN 取自共享选举状态 s_sharedSpnState[st].primaryId；这里只登记候选映射，SendPolicy 时收敛到唯一主SPN。
   {
     Ptr<GmcPolicySenderApp> policyApp = CreateObject<GmcPolicySenderApp> ();
-    for (size_t i = 0; i < m_ifGmcAdhocBackhaul.size (); ++i)
-      policyApp->AddTarget (m_ifGmcAdhocBackhaul[i].GetAddress (1), spnPolicyPort);
-    for (size_t i = 0; i < m_ifGmcDatalinkBackhaul.size (); ++i)
-      policyApp->AddTarget (m_ifGmcDatalinkBackhaul[i].GetAddress (1), spnPolicyPort);
+    for (uint32_t i = 0; i < m_adhocNodes.GetN () && i < m_ifGmcAdhocBackhaul.size (); ++i)
+      {
+        policyApp->AddTarget (HeterogeneousNodeApp::SUBNET_ADHOC,
+                              m_adhocNodes.Get (i)->GetId (),
+                              m_ifGmcAdhocBackhaul[i].GetAddress (1),
+                              spnPolicyPort);
+      }
+    for (uint32_t i = 0; i < m_datalinkNodes.GetN () && i < m_ifGmcDatalinkBackhaul.size (); ++i)
+      {
+        policyApp->AddTarget (HeterogeneousNodeApp::SUBNET_DATALINK,
+                              m_datalinkNodes.Get (i)->GetId (),
+                              m_ifGmcDatalinkBackhaul[i].GetAddress (1),
+                              spnPolicyPort);
+      }
+    if (m_lteEnbNodes.GetN () > 0 && m_ifGmcLteSpn.GetN () >= 2)
+      {
+        policyApp->AddTarget (HeterogeneousNodeApp::SUBNET_LTE,
+                              m_lteEnbNodes.Get (0)->GetId (),
+                              m_ifGmcLteSpn.GetAddress (1),
+                              spnPolicyPort);
+      }
     policyApp->SetInterval (Seconds (10.0));
     m_gmcNode.Get (0)->AddApplication (policyApp);
     policyApp->SetStartTime (Seconds (0.0));
@@ -6415,6 +7729,7 @@ HeterogeneousNmsFramework::InstallApplications ()
   }
 
   Ipv4Address gmcToLteSpnAddr = m_ifGmcLteSpn.GetAddress (0);
+  Ipv4Address lteSpnBackhaulAddr = m_ifGmcLteSpn.GetAddress (1);
 
   {
     uint32_t adhoc0 = 0;
@@ -6510,13 +7825,16 @@ HeterogeneousNmsFramework::InstallApplications ()
       NmsLog ("INFO", node->GetId (), "NODE_ONLINE", nodeOnlineMsg);
   };
 
-  // ---------- LTE：eNB (SPN) + 所有 UE 均向 GMC 上报（无子网聚合） ----------
+  // ---------- LTE：eNB 作为固定 SPN，UE 为普通 TSN，由 eNB 执行 0x13→0x14→0x15→0x16 ----------
   installOne (m_spnLte, gmcToLteSpnAddr, gmcDataPort, HeterogeneousNodeApp::SUBNET_LTE, 200, Seconds (0.5),
-              false, Ipv4Address ("0.0.0.0"), "LTE SPN (eNB) application started.", Ipv4Address ("0.0.0.0"), 0, true);
+              true, Ipv4Address ("0.0.0.0"), "LTE SPN (eNB) application started.", gmcToLteSpnAddr, gmcDataPort, true);
   for (uint32_t i = 0; i < m_lteUeNodes.GetN (); ++i)
     {
       Ptr<Node> ue = m_lteUeNodes.Get (i);
-      installOne (ue, gmcToLteSpnAddr, gmcDataPort, HeterogeneousNodeApp::SUBNET_LTE, 200, Seconds (0.5),
+      Ipv4Address lteControlSpnAddr = (i < m_ifLteEnbToUeBackhaul.size ())
+                                      ? m_ifLteEnbToUeBackhaul[i].GetAddress (0)
+                                      : lteSpnBackhaulAddr;
+      installOne (ue, lteControlSpnAddr, reportPort, HeterogeneousNodeApp::SUBNET_LTE, 200, Seconds (0.5),
                   false, Ipv4Address ("0.0.0.0"), "LTE UE application started.");
     }
   // 在仿真时刻输出（依赖 Simulator::Now），与 Adhoc/DataLink 的 SPN_ANNOUNCE 格式一致，供可视化动态回程
@@ -6609,6 +7927,16 @@ HeterogeneousNmsFramework::InstallApplications ()
         NmsLog ("INFO", nodeId, "ROUTE_PROBE", tag + " no-routing-protocol");
         return;
       }
+    Ptr<HeterogeneousNodeApp> app;
+    for (uint32_t ai = 0; ai < node->GetNApplications (); ++ai)
+      {
+        Ptr<HeterogeneousNodeApp> candidate = DynamicCast<HeterogeneousNodeApp> (node->GetApplication (ai));
+        if (candidate)
+          {
+            app = candidate;
+            break;
+          }
+      }
     Ipv4Header header;
     header.SetDestination (dstAddr);
     Socket::SocketErrno err = Socket::ERROR_NOTERROR;
@@ -6617,6 +7945,10 @@ HeterogeneousNmsFramework::InstallApplications ()
     if (!route)
       {
         NmsLog ("INFO", nodeId, "ROUTE_PROBE", tag + " route=null err=" + std::to_string (static_cast<int> (err)));
+        if (app)
+          {
+            app->ReportRouteFail041 (0, 3, "route_probe_no_route");
+          }
         return;
       }
     std::ostringstream oss;
@@ -6631,23 +7963,55 @@ HeterogeneousNmsFramework::InstallApplications ()
       // 回退默认业务流（兼容旧行为）
       if (m_adhocNodes.GetN () >= 2)
         {
-          BusinessFlowConfig f1 = {1, "video", 2, 2, m_adhocNodes.Get (0)->GetId (), m_adhocNodes.Get (1)->GetId (), "2Mbps", 62500, 5.0, -1.0};
+          BusinessFlowConfig f1 = {1, "video", 2, 2, m_adhocNodes.Get (0)->GetId (), m_adhocNodes.Get (1)->GetId (), "2Mbps", 62500, 0, 5.0, -1.0};
           flows.push_back (f1);
         }
       if (m_adhocNodes.GetN () >= 5)
         {
-          BusinessFlowConfig f2 = {2, "data", 1, 1, m_adhocNodes.Get (1)->GetId (), m_adhocNodes.Get (4)->GetId (), "1Mbps", 512, 7.0, -1.0};
+          BusinessFlowConfig f2 = {2, "data", 1, 1, m_adhocNodes.Get (1)->GetId (), m_adhocNodes.Get (4)->GetId (), "1Mbps", 512, 0, 7.0, -1.0};
           flows.push_back (f2);
         }
       if (m_lteUeNodes.GetN () > 0 && m_lteEnbNodes.GetN () > 0)
         {
           uint32_t srcIdx = std::min<uint32_t> (2, m_lteUeNodes.GetN () - 1);
-          BusinessFlowConfig f3 = {3, "control", 0, 0, m_lteUeNodes.Get (srcIdx)->GetId (), m_lteEnbNodes.Get (0)->GetId (), "100Kbps", 256, 9.0, -1.0};
+          BusinessFlowConfig f3 = {3, "file", 0, 0, m_lteUeNodes.Get (srcIdx)->GetId (), m_lteEnbNodes.Get (0)->GetId (), "100Kbps", 256, 0, 9.0, -1.0};
           flows.push_back (f3);
         }
     }
 
-  uint16_t basePort = 9000;
+  uint16_t businessBasePort = m_useDualChannel ? 10000 : 9000;
+  auto parseRateBps = [] (const std::string& s) -> double {
+    if (s.empty ())
+      {
+        return 0.0;
+      }
+    std::string lower = s;
+    std::transform (lower.begin (), lower.end (), lower.begin (), ::tolower);
+    char* endp = nullptr;
+    double val = std::strtod (lower.c_str (), &endp);
+    if (!std::isfinite (val) || endp == lower.c_str ())
+      {
+        return 0.0;
+      }
+    std::string unit = lower.substr (static_cast<size_t> (endp - lower.c_str ()));
+    if (unit.find ("gbps") != std::string::npos)
+      {
+        return val * 1e9;
+      }
+    if (unit.find ("mbps") != std::string::npos)
+      {
+        return val * 1e6;
+      }
+    if (unit.find ("kbps") != std::string::npos)
+      {
+        return val * 1e3;
+      }
+    if (unit.find ("bps") != std::string::npos)
+      {
+        return val;
+      }
+    return val;
+  };
   for (size_t i = 0; i < flows.size (); ++i)
     {
       const BusinessFlowConfig& fcfg = flows[i];
@@ -6659,7 +8023,7 @@ HeterogeneousNmsFramework::InstallApplications ()
       std::string srcIpStr = GetNodePrimaryIpv4 (srcNode);
       if (srcIpStr.empty ()) continue;
       Ipv4Address dstAddr (dstIpStr.c_str ());
-      uint16_t port = basePort + static_cast<uint16_t> (fcfg.flowId % 500);
+      uint16_t port = businessBasePort + static_cast<uint16_t> (fcfg.flowId % 500);
       std::vector<uint32_t> configuredPath = getConfiguredPath (fcfg.srcNodeId, fcfg.dstNodeId);
       // Install host-route fallback hop-by-hop so configured multi-hop flows
       // (e.g. 5->2->1) can still forward even when dynamic routing is late.
@@ -6695,31 +8059,43 @@ HeterogeneousNmsFramework::InstallApplications ()
       sinkApps.Start (Seconds (0.0));
       sinkApps.Stop (simTime);
 
-      // 业务流采用持续发送模型：不再依赖 scenario 的 stopTime，避免中途归零。
-      std::string bizRate = "500Kbps";
-      if (fcfg.type == "control")
+      // 业务流严格按 scenario_config.json 配置安装；默认自动根据业务大小和速率推导持续时长。
+      std::string bizRate = fcfg.dataRate.empty () ? "1Mbps" : fcfg.dataRate;
+      uint32_t bizPacketSize = (fcfg.packetSize > 0) ? fcfg.packetSize : 1024;
+      double srcJoinTime = GetNodeJoinTime (fcfg.srcNodeId);
+      double dstJoinTime = GetNodeJoinTime (fcfg.dstNodeId);
+      double bizStartTime = (fcfg.startTime >= 0.0)
+                            ? fcfg.startTime
+                            : std::max (srcJoinTime, dstJoinTime);
+      double bizStopTime = m_simTimeSeconds;
+      if (fcfg.sizeBytes > 0)
         {
-          bizRate = "100Kbps";
+          double rateBps = parseRateBps (bizRate);
+          if (rateBps > 0.0)
+            {
+              double durationSec = static_cast<double> (fcfg.sizeBytes) * 8.0 / rateBps;
+              bizStopTime = std::min (bizStartTime + durationSec, m_simTimeSeconds);
+            }
         }
-      else if (fcfg.type == "video")
+      else if (fcfg.stopTime > bizStartTime)
         {
-          bizRate = "1.5Mbps";
+          bizStopTime = std::min (fcfg.stopTime, m_simTimeSeconds);
         }
       OnOffHelper onOff ("ns3::UdpSocketFactory", Address ());
       onOff.SetAttribute ("Remote", AddressValue (InetSocketAddress (dstAddr, port)));
       onOff.SetAttribute ("DataRate", DataRateValue (DataRate (bizRate.c_str ())));
-      onOff.SetAttribute ("PacketSize", UintegerValue (1024));
+      onOff.SetAttribute ("PacketSize", UintegerValue (bizPacketSize));
       // Force CBR send pattern to avoid OnOff duty-cycle throughput loss.
       onOff.SetAttribute ("OnTime", StringValue ("ns3::ConstantRandomVariable[Constant=1000]"));
       onOff.SetAttribute ("OffTime", StringValue ("ns3::ConstantRandomVariable[Constant=0]"));
       ApplicationContainer clientApps = onOff.Install (srcNode);
       double stagger = static_cast<double> (fcfg.flowId % 5) * 0.05; // avoid synchronized burst starts
-      clientApps.Start (Seconds (fcfg.startTime + stagger));
-      clientApps.Stop (Seconds (m_simTimeSeconds));
+      clientApps.Start (Seconds (bizStartTime + stagger));
+      clientApps.Stop (Seconds (std::max (bizStartTime + stagger + 0.001, bizStopTime)));
       {
         const uint8_t ipTos = MapBusinessPriorityToIpTos (fcfg.priority);
         Ptr<OnOffApplication> onOffApp = DynamicCast<OnOffApplication> (clientApps.Get (0));
-        const double tosAt = fcfg.startTime + stagger + 0.0001;
+        const double tosAt = bizStartTime + stagger + 0.0001;
         Simulator::Schedule (Seconds (tosAt), [onOffApp, ipTos, fcfg] () {
             if (!onOffApp)
               {
@@ -6738,7 +8114,7 @@ HeterogeneousNmsFramework::InstallApplications ()
       }
       if (fcfg.flowId == 5)
         {
-          Simulator::Schedule (Seconds (fcfg.startTime + 0.2),
+          Simulator::Schedule (Seconds (bizStartTime + 0.2),
                                [logRouteProbe, fcfg, dstAddr] () {
                                  logRouteProbe (fcfg.srcNodeId, dstAddr, "flow5-src");
                                });
@@ -6746,14 +8122,14 @@ HeterogeneousNmsFramework::InstallApplications ()
           if (p.size () >= 2)
             {
               uint32_t relay = p[1];
-              Simulator::Schedule (Seconds (fcfg.startTime + 0.3),
+              Simulator::Schedule (Seconds (bizStartTime + 0.3),
                                    [logRouteProbe, relay, dstAddr] () {
                                      logRouteProbe (relay, dstAddr, "flow5-relay");
                                    });
             }
         }
 
-      Simulator::Schedule (Seconds (fcfg.startTime), [this, fcfg, getConfiguredPath, bizRate] () {
+      Simulator::Schedule (Seconds (bizStartTime), [this, fcfg, getConfiguredPath, bizRate, bizPacketSize] () {
           std::vector<uint32_t> path = GetOlsrPath (fcfg.srcNodeId, fcfg.dstNodeId);
           if (path.size () < 2)
             {
@@ -6762,9 +8138,8 @@ HeterogeneousNmsFramework::InstallApplications ()
           std::ostringstream oss;
           oss << "flowId=" << fcfg.flowId
               << " priority=" << static_cast<uint32_t> (fcfg.priority)
-              << " qos=" << static_cast<uint32_t> (fcfg.qos)
               << " src=" << fcfg.srcNodeId << " dst=" << fcfg.dstNodeId
-              << " size=" << 1024 << " rate=" << bizRate
+              << " size=" << bizPacketSize << " rate=" << bizRate
               << " type=" << fcfg.type;
           if (!path.empty ())
             {
@@ -6774,7 +8149,7 @@ HeterogeneousNmsFramework::InstallApplications ()
           NmsLog ("INFO", 0, "FLOW_START", oss.str ());
         });
       // Route may not converge exactly at flow start; re-sample shortly after for accurate path display.
-      Simulator::Schedule (Seconds (fcfg.startTime + 1.0), [this, fcfg, getConfiguredPath] () {
+      Simulator::Schedule (Seconds (bizStartTime + 1.0), [this, fcfg, getConfiguredPath] () {
           std::vector<uint32_t> path = GetOlsrPath (fcfg.srcNodeId, fcfg.dstNodeId);
           if (path.size () < 2)
             {
@@ -7975,6 +9350,12 @@ HnmsMain (int argc, char *argv[])
   RngSeedManager::SetSeed (rngSeed);
   RngSeedManager::SetRun (rngRun);
 
+  {
+    std::ostringstream traceFile;
+    traceFile << "policy_state_trace_run" << rngRun << ".csv";
+    hnms::PolicyStateTracer::Init (traceFile.str ());
+  }
+
   LogComponentEnable ("HeterogeneousNodeApp", LOG_LEVEL_INFO);
 
   HeterogeneousNmsFramework framework;
@@ -8009,6 +9390,7 @@ HnmsMain (int argc, char *argv[])
   }
 #endif
   framework.Run (simTime);
+  hnms::PolicyStateTracer::Close ();
 
   return 0;
 }

@@ -1,7 +1,7 @@
 {
-  "flowmonXml": "/home/wxr/ns-3-dev/simulation_results/2026-03-31_17-36-03/performance/flowmon_stats_2026-03-31_17-36-03.xml",
-  "stateDrivenKpiJson": "/home/wxr/ns-3-dev/simulation_results/2026-03-31_17-36-03/performance/state-driven-kpi-summary_2026-03-31_17-36-03.json",
-  "eventsCount": 7754,
-  "adhocChElectCount": 8,
+  "flowmonXml": "/home/wxr/ns-3-dev/simulation_results/2026-04-10_01-12-41/performance/flowmon_stats_2026-04-10_01-12-41.xml",
+  "stateDrivenKpiJson": "/home/wxr/ns-3-dev/simulation_results/2026-04-10_01-12-41/performance/state-driven-kpi-summary_2026-04-10_01-12-41.json",
+  "eventsCount": 912,
+  "adhocChElectCount": 1,
   "adhocClusterHead": 1
 }

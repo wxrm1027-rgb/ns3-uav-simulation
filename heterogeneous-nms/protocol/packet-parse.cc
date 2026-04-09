@@ -97,13 +97,17 @@ std::string ParseTlvValue (const uint8_t* data, uint32_t len)
   uint16_t valLen = (static_cast<uint16_t> (data[1]) << 8) | data[2];
   std::ostringstream oss;
   const char* typeStr = "Unknown";
-  if (type == NmsTlv::TYPE_TELEMETRY_010) typeStr = "Telemetry(0x10)";
+  if (type == NmsTlv::TYPE_TELEMETRY_010) typeStr = "Telemetry010(0x10)";
   else if (type == NmsTlv::TYPE_ROLE_011) typeStr = "Role(0x11)";
   else if (type == NmsTlv::TYPE_SUBNET_012) typeStr = "ConfigModel(0x12)";
+  else if (type == NmsTlv::TYPE_INTENT_013) typeStr = "Intent013(0x13)";
+  else if (type == NmsTlv::TYPE_EXEC_CMD_014) typeStr = "ExecCmd014(0x14)";
+  else if (type == NmsTlv::TYPE_EXEC_RESULT_015) typeStr = "ExecResult015(0x15)";
+  else if (type == NmsTlv::TYPE_INTENT_REPORT_016) typeStr = "IntentReport016(0x16)";
   else if (type == NmsTlv::TYPE_FLOW_020) typeStr = "BusinessModel(0x20)";
   else if (type == NmsTlv::TYPE_TOPO_030) typeStr = "TopologyModel(0x30)";
   else if (type == NmsTlv::TYPE_LINK_031) typeStr = "TopologyModel-LinkCtrl(0x31)";
-  else if (type == NmsTlv::TYPE_FAULT_040) typeStr = "FaultModel(0x40)";
+  else if (type == NmsTlv::TYPE_FAULT_040) typeStr = "Alert040(0x40)";
   else if (type == NmsTlv::TYPE_ROUTE_FAIL_041) typeStr = "RouteFail(0x41)";
   else if (type == NmsTlv::TYPE_HELLO_ELECTION) typeStr = "HelloElection";
   else if (type == NmsTlv::TYPE_NODE_REPORT_SPN) typeStr = "NodeReportSpn";
@@ -112,14 +116,97 @@ std::string ParseTlvValue (const uint8_t* data, uint32_t len)
   oss << "Type=" << typeStr << "(0x" << std::hex << (int)type << std::dec << "), Len=" << valLen;
   if (len >= 3u + valLen)
     {
-      if (type == NmsTlv::TYPE_TELEMETRY_010 && valLen >= 24)
+      if (type == NmsTlv::TYPE_TELEMETRY_010 && valLen == NmsTlv::TELEMETRY_010_VALUE_LEN)
         {
-          double e, q, m;
-          std::memcpy (&e, data + 3, 8);
-          std::memcpy (&q, data + 11, 8);
-          std::memcpy (&m, data + 19, 8);
-          oss << " [energy=" << std::fixed << std::setprecision (3) << e
-              << ", linkQ=" << q << ", mobility=" << m << "]";
+          NmsTlv::Telemetry010 t = {};
+          if (NmsTlv::ParseTelemetry010 (data, len, &t) > 0)
+            {
+              oss << " [NodeID=" << static_cast<uint32_t> (t.nodeId)
+                  << ", BatteryLevel=" << static_cast<uint32_t> (t.batteryLevel)
+                  << ", PosX=" << std::fixed << std::setprecision (3) << t.posX
+                  << ", PosY=" << t.posY
+                  << ", PosZ=" << t.posZ
+                  << ", Vx=" << t.vx
+                  << ", Vy=" << t.vy
+                  << ", Vz=" << t.vz << "]";
+            }
+        }
+      else if (type == NmsTlv::TYPE_ROLE_011 && valLen == NmsTlv::ROLE_011_VALUE_LEN)
+        {
+          NmsTlv::Role011 t = {};
+          if (NmsTlv::ParseRole011 (data, len, &t) > 0)
+            {
+              oss << " [NodeID=" << static_cast<uint32_t> (t.nodeId)
+                  << ", RoleType=" << static_cast<uint32_t> (t.roleType)
+                  << ", ComputeLevel=" << static_cast<uint32_t> (t.computeLevel) << "]";
+            }
+        }
+      else if (type == NmsTlv::TYPE_INTENT_013 && valLen == NmsTlv::INTENT_013_VALUE_LEN)
+        {
+          NmsTlv::Intent013 t = {};
+          if (NmsTlv::ParseIntent013 (data, len, &t) > 0)
+            {
+              oss << " [IntentID=" << static_cast<uint32_t> (t.intentId)
+                  << ", IntentType=" << static_cast<uint32_t> (t.intentType)
+                  << ", ValidTime=" << t.validTime
+                  << ", Param1=" << t.param1
+                  << ", Param2=" << static_cast<uint32_t> (t.param2) << "]";
+            }
+        }
+      else if (type == NmsTlv::TYPE_EXEC_CMD_014 && valLen == NmsTlv::EXEC_CMD_014_VALUE_LEN)
+        {
+          NmsTlv::ExecCmd014 t = {};
+          if (NmsTlv::ParseExecCmd014 (data, len, &t) > 0)
+            {
+              oss << " [IntentID=" << static_cast<uint32_t> (t.intentId)
+                  << ", CmdSeq=" << static_cast<uint32_t> (t.cmdSeq)
+                  << ", TargetNodeID=" << static_cast<uint32_t> (t.targetNodeId)
+                  << ", CmdType=" << static_cast<uint32_t> (t.cmdType)
+                  << ", CmdParam=" << t.cmdParam << "]";
+            }
+        }
+      else if (type == NmsTlv::TYPE_EXEC_RESULT_015 && valLen == NmsTlv::EXEC_RESULT_015_VALUE_LEN)
+        {
+          NmsTlv::ExecResult015 t = {};
+          if (NmsTlv::ParseExecResult015 (data, len, &t) > 0)
+            {
+              oss << " [IntentID=" << static_cast<uint32_t> (t.intentId)
+                  << ", CmdSeq=" << static_cast<uint32_t> (t.cmdSeq)
+                  << ", ExecResult=" << static_cast<uint32_t> (t.execResult)
+                  << ", FailReason=" << static_cast<uint32_t> (t.failReason) << "]";
+            }
+        }
+      else if (type == NmsTlv::TYPE_INTENT_REPORT_016 && valLen == NmsTlv::INTENT_REPORT_016_VALUE_LEN)
+        {
+          NmsTlv::IntentReport016 t = {};
+          if (NmsTlv::ParseIntentReport016 (data, len, &t) > 0)
+            {
+              oss << " [IntentID=" << static_cast<uint32_t> (t.intentId)
+                  << ", TotalTargets=" << static_cast<uint32_t> (t.totalTargets)
+                  << ", SuccessCount=" << static_cast<uint32_t> (t.successCount)
+                  << ", FailCount=" << static_cast<uint32_t> (t.failCount) << "]";
+            }
+        }
+      else if (type == NmsTlv::TYPE_FAULT_040 && valLen == NmsTlv::ALERT_040_VALUE_LEN)
+        {
+          NmsTlv::Alert040 t = {};
+          if (NmsTlv::ParseAlert040 (data, len, &t) > 0)
+            {
+              oss << " [ReportNodeID=" << static_cast<uint32_t> (t.reportNodeId)
+                  << ", TargetNodeID=" << static_cast<uint32_t> (t.targetNodeId)
+                  << ", AlertLevel=" << static_cast<uint32_t> (t.alertLevel)
+                  << ", AlertReason=" << static_cast<uint32_t> (t.alertReason) << "]";
+            }
+        }
+      else if (type == NmsTlv::TYPE_ROUTE_FAIL_041 && valLen == NmsTlv::ROUTE_FAIL_041_VALUE_LEN)
+        {
+          NmsTlv::RouteFail041 t = {};
+          if (NmsTlv::ParseRouteFail041 (data, len, &t) > 0)
+            {
+              oss << " [FlowID=" << static_cast<uint32_t> (t.flowId)
+                  << ", FaultNodeID=" << static_cast<uint32_t> (t.faultNodeId)
+                  << ", FailReason=" << static_cast<uint32_t> (t.failReason) << "]";
+            }
         }
       else if (type == NmsTlv::TYPE_LINK_031 && valLen >= 8)
         {
