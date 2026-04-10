@@ -107,6 +107,117 @@ NmsLog (const char* level, uint32_t nodeId, const char* eventType, const std::st
 
 // ====================== 时序入网：JSON 配置 + JSONL 状态日志 ======================
 static std::ofstream g_jsonlStateFile;
+static std::ofstream g_failoverEventsFile;
+static std::ofstream g_uvMibSnapshotFile;
+static bool g_failoverObserved = false;
+
+struct HnmpTlvLifecycleStat
+{
+  uint64_t buildCount = 0;
+  uint64_t txCount = 0;
+  uint64_t rxCount = 0;
+  uint64_t handleCount = 0;
+  uint64_t totalBytes = 0;
+};
+
+static std::map<uint8_t, HnmpTlvLifecycleStat> g_hnmpTlvStats;
+static std::ofstream g_hnmpTlvTraceFile;
+
+static std::string
+FormatTlvHex (uint8_t type)
+{
+  std::ostringstream oss;
+  oss << "0x" << std::hex << std::setw (2) << std::setfill ('0') << static_cast<uint32_t> (type);
+  return oss.str ();
+}
+
+static const char*
+GetTlvEvidenceLevel (uint8_t type)
+{
+  switch (type)
+    {
+    case NmsTlv::TYPE_TELEMETRY_010:
+    case NmsTlv::TYPE_ROLE_011:
+    case NmsTlv::TYPE_INTENT_013:
+    case NmsTlv::TYPE_EXEC_CMD_014:
+    case NmsTlv::TYPE_EXEC_RESULT_015:
+    case NmsTlv::TYPE_INTENT_REPORT_016:
+    case NmsTlv::TYPE_FAULT_040:
+    case NmsTlv::TYPE_ROUTE_FAIL_041:
+      return "full_path";
+    case NmsTlv::TYPE_SUBNET_012:
+    case NmsTlv::TYPE_FLOW_020:
+    case NmsTlv::TYPE_FLOW_AGG_021:
+    case NmsTlv::TYPE_TOPO_030:
+    case NmsTlv::TYPE_LINK_031:
+    case NmsTlv::TYPE_LINK_LOSS_032:
+    case NmsTlv::TYPE_LINK_STATUS_033:
+    case NmsTlv::TYPE_LINK_AGG_034:
+      return "partial_path";
+    default:
+      return "other";
+    }
+}
+
+static bool
+IsImplementedTlv (uint8_t type)
+{
+  switch (type)
+    {
+    case NmsTlv::TYPE_TELEMETRY_010:
+    case NmsTlv::TYPE_ROLE_011:
+    case NmsTlv::TYPE_SUBNET_012:
+    case NmsTlv::TYPE_INTENT_013:
+    case NmsTlv::TYPE_EXEC_CMD_014:
+    case NmsTlv::TYPE_EXEC_RESULT_015:
+    case NmsTlv::TYPE_INTENT_REPORT_016:
+    case NmsTlv::TYPE_FLOW_020:
+    case NmsTlv::TYPE_FLOW_AGG_021:
+    case NmsTlv::TYPE_TOPO_030:
+    case NmsTlv::TYPE_LINK_031:
+    case NmsTlv::TYPE_LINK_LOSS_032:
+    case NmsTlv::TYPE_LINK_STATUS_033:
+    case NmsTlv::TYPE_LINK_AGG_034:
+    case NmsTlv::TYPE_FAULT_040:
+    case NmsTlv::TYPE_ROUTE_FAIL_041:
+      return true;
+    default:
+      return false;
+    }
+}
+
+static std::string
+GetNodeRoleLabelById (uint32_t nodeId)
+{
+  return (nodeId == 0) ? "GMC" : "NODE";
+}
+
+static void
+RecordTlvLifecycleEvent (const char* stage, uint8_t type, uint32_t nodeId,
+                         const std::string& src, const std::string& dst,
+                         uint32_t bytes, const std::string& summary)
+{
+  HnmpTlvLifecycleStat& stat = g_hnmpTlvStats[type];
+  if (std::strcmp (stage, "HNMP_TLV_BUILD") == 0) stat.buildCount++;
+  else if (std::strcmp (stage, "HNMP_TLV_TX") == 0) stat.txCount++;
+  else if (std::strcmp (stage, "HNMP_TLV_RX") == 0) stat.rxCount++;
+  else if (std::strcmp (stage, "HNMP_TLV_HANDLE") == 0) stat.handleCount++;
+  stat.totalBytes += bytes;
+  if (g_hnmpTlvTraceFile.is_open ())
+    {
+      g_hnmpTlvTraceFile
+          << std::fixed << std::setprecision (6) << Simulator::Now ().GetSeconds () << ","
+          << stage << ","
+          << FormatTlvHex (type) << ","
+          << src << ","
+          << dst << ","
+          << nodeId << ","
+          << GetNodeRoleLabelById (nodeId) << ","
+          << '"' << summary << '"'
+          << std::endl;
+      g_hnmpTlvTraceFile.flush ();
+    }
+}
 
 #ifndef HNMS_USE_MODULES
 struct NodeJoinConfig
@@ -1668,8 +1779,12 @@ private:
   uint32_t        m_heartbeatSendSeq;      ///< 主 SPN 心跳发送序号（验证日志）
   uint32_t        m_lastSyncedCommittedPrimaryId; ///< 上次从共享状态同步的主 SPN（用于主切换时重置备用心跳跟踪）
   double          m_backupHeartbeatGraceUntilTs; ///< 备 SPN：主切换后到此时刻前不累计心跳丢失（等待新主首包）
-  bool            m_failoverPending;       ///< 已触发接管判定，等待成为主SPN
+  bool m_failoverPending;       ///< 已触发接管判定，等待成为主SPN
+  bool m_failoverRecordActive;  ///< 当前节点是否已记录一轮待完成的 failover 证据
   double          m_failoverStartTs;       ///< 触发接管时刻，用于自愈耗时统计
+  uint32_t        m_failoverRecordedOldPrimaryId; ///< 本轮 failover 原主节点
+  uint32_t        m_failoverRecordedBackupId;     ///< 本轮 failover 记录的备节点
+  std::string     m_failoverRecordedReason;       ///< 本轮 failover 原因
   double          m_joinTime;             ///< 入网时间（秒），未到则应用层静默、不耗电
   bool            m_scoreFilterInit;       ///< EMA 状态是否已初始化
   double          m_initialEnergyRef;      ///< 初始能量（用于 E_norm=当前/初始；与 UV-MIB 同量纲，通常为 0~1）
@@ -1797,6 +1912,25 @@ private:
     double energy, linkQ;
     std::vector<uint32_t> neighborIds;
   };
+  struct FlowPerfState
+  {
+    uint8_t reporterNodeId {0};
+    uint16_t flowId {0};
+    uint8_t priority {0};
+    double throughputMbps {0.0};
+    double delayMs {0.0};
+    double lossPct {0.0};
+    double lastTs {0.0};
+  };
+  struct LinkMetricState
+  {
+    uint8_t reporterNodeId {0};
+    double linkQuality {0.0};
+    double lossPct {0.0};
+    uint8_t linkState {0};
+    uint8_t upNeighbors {0};
+    double lastTs {0.0};
+  };
   struct IntentExecState
   {
     uint8_t totalTargets {0};
@@ -1805,6 +1939,8 @@ private:
     std::set<uint8_t> reportedCmdSeqs;
   };
   std::map<uint32_t, NodeReportState> m_subnetNodeStates;
+  std::map<uint32_t, FlowPerfState> m_flowPerfStates;
+  std::map<uint32_t, LinkMetricState> m_linkMetricStates;
   std::set<std::pair<uint32_t, uint32_t>> m_subnetEdges;  ///< 拓扑边 (from, to)，from < to 存储
   uint8_t m_lastRoleTypeCode;
   std::map<uint16_t, double> m_lastRouteFailTsByFlow;
@@ -1858,7 +1994,11 @@ HeterogeneousNodeApp::HeterogeneousNodeApp ()
     m_lastSyncedCommittedPrimaryId (0),
     m_backupHeartbeatGraceUntilTs (-1.0),
     m_failoverPending (false),
+    m_failoverRecordActive (false),
     m_failoverStartTs (0.0),
+    m_failoverRecordedOldPrimaryId (0),
+    m_failoverRecordedBackupId (0),
+    m_failoverRecordedReason (),
     m_joinTime (0.0),
     m_scoreFilterInit (false),
     m_initialEnergyRef (0.9),
@@ -2037,6 +2177,8 @@ HeterogeneousNodeApp::LogStandardTlvEvent (const char* stage, uint8_t type, cons
   std::ostringstream oss;
   oss << "stage=" << stage << " type=0x" << std::hex << std::setw (2) << std::setfill ('0')
       << static_cast<uint32_t> (type) << std::dec << " node=" << GetNode ()->GetId () << " " << details;
+  RecordTlvLifecycleEvent (stage, type, GetNode ()->GetId (), "node=" + std::to_string (GetNode ()->GetId ()),
+                           "n/a", 0, details);
   NMS_LOG_INFO (GetNode ()->GetId (), stage, oss.str ());
 }
 
@@ -2810,6 +2952,13 @@ HeterogeneousNodeApp::CheckPrimaryHeartbeat ()
             {
               m_failoverPending = true;
               m_failoverStartTs = now;
+              if (!m_failoverRecordActive)
+                {
+                  m_failoverRecordActive = true;
+                  m_failoverRecordedOldPrimaryId = m_currentPrimaryId;
+                  m_failoverRecordedBackupId = GetNode ()->GetId ();
+                  m_failoverRecordedReason = "heartbeat_primary_lost_failover";
+                }
               m_globalScoreTime[m_currentPrimaryId] = 0.0; // 将原主SPN标记为失效，触发重选
               NMS_LOG_INFO (GetNode ()->GetId (), "SPN_HEARTBEAT_LOST",
                             "primary=" + std::to_string (m_currentPrimaryId) +
@@ -3817,6 +3966,28 @@ HeterogeneousNodeApp::PublishSpnAnnounceAfterElection (double primaryScoreVal, d
       << " primaryScore=" << std::fixed << std::setprecision (3) << primaryScoreVal
       << " backupScore=" << std::setprecision (3) << backupScoreVal;
   NMS_LOG_INFO (selfId, "SPN_ANNOUNCE", oss.str ());
+  if (m_failoverRecordActive && g_failoverEventsFile.is_open ())
+    {
+      const double endTs = now;
+      const double healDurationMs = std::max (0.0, (endTs - m_failoverStartTs) * 1000.0);
+      g_failoverEventsFile
+          << static_cast<uint32_t> (m_subnetType) << ","
+          << m_failoverRecordedOldPrimaryId << ","
+          << spnNodeId << ","
+          << m_failoverRecordedBackupId << ","
+          << m_failoverRecordedReason << ","
+          << std::fixed << std::setprecision (6) << m_failoverStartTs << ","
+          << std::fixed << std::setprecision (6) << endTs << ","
+          << std::fixed << std::setprecision (3) << healDurationMs
+          << std::endl;
+      g_failoverEventsFile.flush ();
+      g_failoverObserved = true;
+      m_failoverRecordActive = false;
+      m_failoverPending = false;
+      m_failoverRecordedOldPrimaryId = 0;
+      m_failoverRecordedBackupId = 0;
+      m_failoverRecordedReason.clear ();
+    }
   const char* subLbl = (m_subnetType == SUBNET_DATALINK) ? "DataLink" : "Adhoc";
   std::ostringstream spnElect;
   spnElect << std::fixed << std::setprecision (1) << "t=" << now << "s [SPN_ELECT] SubNet: " << subLbl
@@ -4372,167 +4543,261 @@ HeterogeneousNodeApp::RecvFromSubnet (Ptr<Socket> socket)
       packet->CopyData (data.data (), len);
       const uint8_t* payload = nullptr;
       uint32_t payloadLen = 0;
-      if (!ParseHnmpFrame (data.data (), len, &payload, &payloadLen)) continue;
+      if (!ParseHnmpFrame (data.data (), len, &payload, &payloadLen))
+        {
+          continue;
+        }
       NmsPacketParse::LogDataPacket (GetNode ()->GetId (), "RECV", src, Ipv4Address ("0.0.0.0"), iaddr.GetPort (), m_subnetReportPort, payload, payloadLen);
       m_aggregateBuf[src] = std::vector<uint8_t> (payload, payload + payloadLen);
 
-      const uint8_t* buf = payload;
-      if (payloadLen >= 3 && buf[0] == NmsTlv::TYPE_TELEMETRY_010)
+      uint32_t off = 0;
+      while (off + 3 <= payloadLen)
         {
-          std::ostringstream rx;
-          rx << "src=" << src << " bytes=" << payloadLen;
-          LogStandardTlvEvent ("HNMP_TLV_RX", NmsTlv::TYPE_TELEMETRY_010, rx.str ());
-          NmsTlv::Telemetry010 t = {};
-          if (NmsTlv::ParseTelemetry010 (buf, payloadLen, &t) > 0)
+          const uint8_t* tlv = payload + off;
+          uint16_t valLen = (static_cast<uint16_t> (tlv[1]) << 8) | tlv[2];
+          uint32_t tlvLen = 3u + valLen;
+          if (off + tlvLen > payloadLen)
             {
-              NodeReportState st = {};
-              st.nodeId = t.nodeId;
-              st.px = t.posX;
-              st.py = t.posY;
-              st.pz = t.posZ;
-              st.vx = t.vx;
-              st.vy = t.vy;
-              st.vz = t.vz;
-              st.energy = static_cast<double> (t.batteryLevel) / 255.0;
-              st.linkQ = 0.0;
-              m_subnetNodeStates[st.nodeId] = st;
-              LogStandardTlvEvent ("HNMP_TLV_HANDLE", NmsTlv::TYPE_TELEMETRY_010,
-                                   "store nodeId=" + std::to_string (st.nodeId) +
-                                   " energy=" + std::to_string (st.energy));
+              break;
             }
-        }
-      else if (payloadLen >= 3 && buf[0] == NmsTlv::TYPE_ROLE_011)
-        {
+
           std::ostringstream rx;
-          rx << "src=" << src << " bytes=" << payloadLen;
-          LogStandardTlvEvent ("HNMP_TLV_RX", NmsTlv::TYPE_ROLE_011, rx.str ());
-          NmsTlv::Role011 role = {};
-          if (NmsTlv::ParseRole011 (buf, payloadLen, &role) > 0)
+          rx << "src=" << src << " bytes=" << tlvLen;
+
+          if (tlv[0] == NmsTlv::TYPE_TELEMETRY_010)
             {
-              LogStandardTlvEvent ("HNMP_TLV_HANDLE", NmsTlv::TYPE_ROLE_011,
-                                   "nodeId=" + std::to_string (static_cast<uint32_t> (role.nodeId)) +
-                                   " roleType=" + std::to_string (static_cast<uint32_t> (role.roleType)) +
-                                   " computeLevel=" + std::to_string (static_cast<uint32_t> (role.computeLevel)));
-              if (m_socket && m_gmcBackhaulAddress != Ipv4Address ("0.0.0.0") && m_gmcBackhaulPort != 0)
+              LogStandardTlvEvent ("HNMP_TLV_RX", NmsTlv::TYPE_TELEMETRY_010, rx.str ());
+              NmsTlv::Telemetry010 t = {};
+              if (NmsTlv::ParseTelemetry010 (tlv, tlvLen, &t) > 0)
                 {
-                  uint8_t frameOut[64];
-                  uint32_t frameLen = BuildHnmpFrame (Hnmp::FRAME_REPORT, 1, 0, buf, payloadLen, frameOut, sizeof (frameOut));
-                  if (frameLen > 0)
+                  NodeReportState st = {};
+                  st.nodeId = t.nodeId;
+                  st.px = t.posX;
+                  st.py = t.posY;
+                  st.pz = t.posZ;
+                  st.vx = t.vx;
+                  st.vy = t.vy;
+                  st.vz = t.vz;
+                  st.energy = static_cast<double> (t.batteryLevel) / 255.0;
+                  m_subnetNodeStates[st.nodeId] = st;
+                  LogStandardTlvEvent ("HNMP_TLV_HANDLE", NmsTlv::TYPE_TELEMETRY_010,
+                                       "store nodeId=" + std::to_string (st.nodeId) +
+                                       " energy=" + std::to_string (st.energy));
+                }
+            }
+          else if (tlv[0] == NmsTlv::TYPE_ROLE_011)
+            {
+              LogStandardTlvEvent ("HNMP_TLV_RX", NmsTlv::TYPE_ROLE_011, rx.str ());
+              NmsTlv::Role011 role = {};
+              if (NmsTlv::ParseRole011 (tlv, tlvLen, &role) > 0)
+                {
+                  LogStandardTlvEvent ("HNMP_TLV_HANDLE", NmsTlv::TYPE_ROLE_011,
+                                       "nodeId=" + std::to_string (static_cast<uint32_t> (role.nodeId)) +
+                                       " roleType=" + std::to_string (static_cast<uint32_t> (role.roleType)) +
+                                       " computeLevel=" + std::to_string (static_cast<uint32_t> (role.computeLevel)));
+                  if (m_socket && m_gmcBackhaulAddress != Ipv4Address ("0.0.0.0") && m_gmcBackhaulPort != 0)
                     {
-                      m_socket->Send (Create<Packet> (frameOut, frameLen));
-                      NmsPacketParse::LogDataPacket (GetNode ()->GetId (), "SEND", Ipv4Address ("0.0.0.0"), m_gmcBackhaulAddress, 0, m_gmcBackhaulPort, frameOut, frameLen);
-                      LogStandardTlvEvent ("HNMP_TLV_TX", NmsTlv::TYPE_ROLE_011,
-                                           "forward_to_gmc nodeId=" + std::to_string (static_cast<uint32_t> (role.nodeId)));
+                      uint8_t frameOut[64];
+                      uint32_t frameLen = BuildHnmpFrame (Hnmp::FRAME_REPORT, 1, 0, tlv, tlvLen, frameOut, sizeof (frameOut));
+                      if (frameLen > 0)
+                        {
+                          m_socket->Send (Create<Packet> (frameOut, frameLen));
+                          NmsPacketParse::LogDataPacket (GetNode ()->GetId (), "SEND", Ipv4Address ("0.0.0.0"), m_gmcBackhaulAddress, 0, m_gmcBackhaulPort, frameOut, frameLen);
+                          LogStandardTlvEvent ("HNMP_TLV_TX", NmsTlv::TYPE_ROLE_011,
+                                               "forward_to_gmc nodeId=" + std::to_string (static_cast<uint32_t> (role.nodeId)));
+                        }
                     }
                 }
             }
-        }
-      else if (payloadLen >= 3 && buf[0] == NmsTlv::TYPE_EXEC_RESULT_015)
-        {
-          std::ostringstream rx;
-          rx << "src=" << src << " bytes=" << payloadLen;
-          LogStandardTlvEvent ("HNMP_TLV_RX", NmsTlv::TYPE_EXEC_RESULT_015, rx.str ());
-          NmsTlv::ExecResult015 result = {};
-          if (NmsTlv::ParseExecResult015 (buf, payloadLen, &result) > 0)
+          else if (tlv[0] == NmsTlv::TYPE_EXEC_RESULT_015)
             {
-              LogStandardTlvEvent ("HNMP_TLV_HANDLE", NmsTlv::TYPE_EXEC_RESULT_015,
-                                   "intentId=" + std::to_string (static_cast<uint32_t> (result.intentId)) +
-                                   " cmdSeq=" + std::to_string (static_cast<uint32_t> (result.cmdSeq)) +
-                                   " execResult=" + std::to_string (static_cast<uint32_t> (result.execResult)) +
-                                   " failReason=" + std::to_string (static_cast<uint32_t> (result.failReason)));
-              IntentExecState& st = m_intentExecStates[result.intentId];
-              if (st.reportedCmdSeqs.insert (result.cmdSeq).second)
+              LogStandardTlvEvent ("HNMP_TLV_RX", NmsTlv::TYPE_EXEC_RESULT_015, rx.str ());
+              NmsTlv::ExecResult015 result = {};
+              if (NmsTlv::ParseExecResult015 (tlv, tlvLen, &result) > 0)
                 {
-                  if (result.execResult == 0)
+                  LogStandardTlvEvent ("HNMP_TLV_HANDLE", NmsTlv::TYPE_EXEC_RESULT_015,
+                                       "intentId=" + std::to_string (static_cast<uint32_t> (result.intentId)) +
+                                       " cmdSeq=" + std::to_string (static_cast<uint32_t> (result.cmdSeq)) +
+                                       " execResult=" + std::to_string (static_cast<uint32_t> (result.execResult)) +
+                                       " failReason=" + std::to_string (static_cast<uint32_t> (result.failReason)));
+                  IntentExecState& st = m_intentExecStates[result.intentId];
+                  if (st.reportedCmdSeqs.insert (result.cmdSeq).second)
                     {
-                      st.successCount = static_cast<uint8_t> (st.successCount + 1);
+                      if (result.execResult == 0)
+                        {
+                          st.successCount = static_cast<uint8_t> (st.successCount + 1);
+                        }
+                      else
+                        {
+                          st.failCount = static_cast<uint8_t> (st.failCount + 1);
+                        }
                     }
-                  else
+                  if (st.totalTargets > 0 && st.successCount + st.failCount >= st.totalTargets && m_socket)
                     {
-                      st.failCount = static_cast<uint8_t> (st.failCount + 1);
+                      NmsTlv::IntentReport016 report = {};
+                      report.intentId = result.intentId;
+                      report.totalTargets = st.totalTargets;
+                      report.successCount = st.successCount;
+                      report.failCount = st.failCount;
+                      uint8_t tlvOut[64];
+                      uint8_t frameOut[96];
+                      uint32_t outLen = NmsTlv::BuildIntentReport016Payload (tlvOut, sizeof (tlvOut), report);
+                      uint32_t frameLen = BuildHnmpFrame (Hnmp::FRAME_REPORT, 1, 0, tlvOut, outLen, frameOut, sizeof (frameOut));
+                      if (outLen > 0 && frameLen > 0)
+                        {
+                          LogStandardTlvEvent ("HNMP_TLV_BUILD", NmsTlv::TYPE_INTENT_REPORT_016,
+                                               "intentId=" + std::to_string (static_cast<uint32_t> (report.intentId)) +
+                                               " totalTargets=" + std::to_string (static_cast<uint32_t> (report.totalTargets)) +
+                                               " successCount=" + std::to_string (static_cast<uint32_t> (report.successCount)) +
+                                               " failCount=" + std::to_string (static_cast<uint32_t> (report.failCount)));
+                          m_socket->Send (Create<Packet> (frameOut, frameLen));
+                          NmsPacketParse::LogDataPacket (GetNode ()->GetId (), "SEND", Ipv4Address ("0.0.0.0"), m_gmcBackhaulAddress, 0, m_gmcBackhaulPort, frameOut, frameLen);
+                          std::ostringstream tx;
+                          tx << "intentId=" << static_cast<uint32_t> (report.intentId)
+                             << " dst=" << m_gmcBackhaulAddress;
+                          LogStandardTlvEvent ("HNMP_TLV_TX", NmsTlv::TYPE_INTENT_REPORT_016, tx.str ());
+                        }
+                      m_intentExecStates.erase (result.intentId);
                     }
                 }
-              if (st.totalTargets > 0 && st.successCount + st.failCount >= st.totalTargets && m_socket)
+            }
+          else if (tlv[0] == NmsTlv::TYPE_FLOW_020)
+            {
+              LogStandardTlvEvent ("HNMP_TLV_RX", NmsTlv::TYPE_FLOW_020, rx.str ());
+              NmsTlv::Flow020 flow = {};
+              if (NmsTlv::ParseFlow020 (tlv, tlvLen, &flow) > 0)
                 {
-                  NmsTlv::IntentReport016 report = {};
-                  report.intentId = result.intentId;
-                  report.totalTargets = st.totalTargets;
-                  report.successCount = st.successCount;
-                  report.failCount = st.failCount;
-                  uint8_t tlvOut[64];
-                  uint8_t frameOut[96];
-                  uint32_t tlvLen = NmsTlv::BuildIntentReport016Payload (tlvOut, sizeof (tlvOut), report);
-                  uint32_t frameLen = BuildHnmpFrame (Hnmp::FRAME_REPORT, 1, 0, tlvOut, tlvLen, frameOut, sizeof (frameOut));
-                  if (tlvLen > 0 && frameLen > 0)
-                    {
-                      LogStandardTlvEvent ("HNMP_TLV_BUILD", NmsTlv::TYPE_INTENT_REPORT_016,
-                                           "intentId=" + std::to_string (static_cast<uint32_t> (report.intentId)) +
-                                           " totalTargets=" + std::to_string (static_cast<uint32_t> (report.totalTargets)) +
-                                           " successCount=" + std::to_string (static_cast<uint32_t> (report.successCount)) +
-                                           " failCount=" + std::to_string (static_cast<uint32_t> (report.failCount)));
-                      m_socket->Send (Create<Packet> (frameOut, frameLen));
-                      NmsPacketParse::LogDataPacket (GetNode ()->GetId (), "SEND", Ipv4Address ("0.0.0.0"), m_gmcBackhaulAddress, 0, m_gmcBackhaulPort, frameOut, frameLen);
-                      std::ostringstream tx;
-                      tx << "intentId=" << static_cast<uint32_t> (report.intentId)
-                         << " dst=" << m_gmcBackhaulAddress;
-                      LogStandardTlvEvent ("HNMP_TLV_TX", NmsTlv::TYPE_INTENT_REPORT_016, tx.str ());
-                    }
-                  m_intentExecStates.erase (result.intentId);
+                  FlowPerfState st = {};
+                  st.reporterNodeId = flow.reporterNodeId;
+                  st.flowId = flow.flowId;
+                  st.priority = flow.priority;
+                  st.throughputMbps = flow.throughputMbps;
+                  st.delayMs = flow.delayMs;
+                  st.lossPct = flow.lossPct;
+                  st.lastTs = Simulator::Now ().GetSeconds ();
+                  m_flowPerfStates[flow.reporterNodeId] = st;
+                  LogStandardTlvEvent ("HNMP_TLV_HANDLE", NmsTlv::TYPE_FLOW_020,
+                                       "nodeId=" + std::to_string (static_cast<uint32_t> (flow.reporterNodeId)) +
+                                       " flowId=" + std::to_string (flow.flowId) +
+                                       " priority=" + std::to_string (static_cast<uint32_t> (flow.priority)));
                 }
             }
-        }
-      else if (payloadLen >= 3 && buf[0] == NmsTlv::TYPE_FAULT_040)
-        {
-          std::ostringstream rx;
-          rx << "src=" << src << " bytes=" << payloadLen;
-          LogStandardTlvEvent ("HNMP_TLV_RX", NmsTlv::TYPE_FAULT_040, rx.str ());
-          NmsTlv::Alert040 alert = {};
-          if (NmsTlv::ParseAlert040 (buf, payloadLen, &alert) > 0)
+          else if (tlv[0] == NmsTlv::TYPE_TOPO_030)
             {
-              LogStandardTlvEvent ("HNMP_TLV_HANDLE", NmsTlv::TYPE_FAULT_040,
-                                   "reporter=" + std::to_string (static_cast<uint32_t> (alert.reportNodeId)) +
-                                   " target=" + std::to_string (static_cast<uint32_t> (alert.targetNodeId)) +
-                                   " level=" + std::to_string (static_cast<uint32_t> (alert.alertLevel)) +
-                                   " reason=" + std::to_string (static_cast<uint32_t> (alert.alertReason)));
+              LogStandardTlvEvent ("HNMP_TLV_RX", NmsTlv::TYPE_TOPO_030, rx.str ());
+              NmsTlv::Topo030 topo = {};
+              if (NmsTlv::ParseTopo030 (tlv, tlvLen, &topo) > 0)
+                {
+                  NodeReportState& st = m_subnetNodeStates[topo.reporterNodeId];
+                  st.nodeId = topo.reporterNodeId;
+                  st.linkQ = topo.avgLinkQuality;
+                  LinkMetricState& lm = m_linkMetricStates[topo.reporterNodeId];
+                  lm.reporterNodeId = topo.reporterNodeId;
+                  lm.linkQuality = topo.avgLinkQuality;
+                  lm.upNeighbors = topo.neighborCount;
+                  lm.lastTs = Simulator::Now ().GetSeconds ();
+                  LogStandardTlvEvent ("HNMP_TLV_HANDLE", NmsTlv::TYPE_TOPO_030,
+                                       "nodeId=" + std::to_string (static_cast<uint32_t> (topo.reporterNodeId)) +
+                                       " neighborCount=" + std::to_string (static_cast<uint32_t> (topo.neighborCount)));
+                }
             }
-          uint8_t frameOut[64];
-          uint32_t frameLen = BuildHnmpFrame (Hnmp::FRAME_ALERT, 1, 0, buf, payloadLen, frameOut, sizeof (frameOut));
-          if (frameLen > 0 && m_socket)
+          else if (tlv[0] == NmsTlv::TYPE_LINK_031)
             {
-              m_socket->Send (Create<Packet> (frameOut, frameLen));
-              NmsPacketParse::LogDataPacket (GetNode ()->GetId (), "SEND", Ipv4Address ("0.0.0.0"), m_gmcBackhaulAddress, 0, m_gmcBackhaulPort, frameOut, frameLen);
-              std::ostringstream tx;
-              tx << "forward_to_gmc dst=" << m_gmcBackhaulAddress;
-              LogStandardTlvEvent ("HNMP_TLV_TX", NmsTlv::TYPE_FAULT_040, tx.str ());
+              LogStandardTlvEvent ("HNMP_TLV_RX", NmsTlv::TYPE_LINK_031, rx.str ());
+              NmsTlv::Link031 link = {};
+              if (NmsTlv::ParseLink031 (tlv, tlvLen, &link) > 0)
+                {
+                  LinkMetricState& lm = m_linkMetricStates[link.reporterNodeId];
+                  lm.reporterNodeId = link.reporterNodeId;
+                  lm.linkQuality = link.linkQuality;
+                  lm.lastTs = Simulator::Now ().GetSeconds ();
+                  LogStandardTlvEvent ("HNMP_TLV_HANDLE", NmsTlv::TYPE_LINK_031,
+                                       "nodeId=" + std::to_string (static_cast<uint32_t> (link.reporterNodeId)) +
+                                       " linkQualityProxy=" + std::to_string (link.linkQuality));
+                }
             }
-        }
-      else if (payloadLen >= 3 && buf[0] == NmsTlv::TYPE_ROUTE_FAIL_041)
-        {
-          std::ostringstream rx;
-          rx << "src=" << src << " bytes=" << payloadLen;
-          LogStandardTlvEvent ("HNMP_TLV_RX", NmsTlv::TYPE_ROUTE_FAIL_041, rx.str ());
-          NmsTlv::RouteFail041 fail = {};
-          if (NmsTlv::ParseRouteFail041 (buf, payloadLen, &fail) > 0)
+          else if (tlv[0] == NmsTlv::TYPE_LINK_LOSS_032)
             {
-              LogStandardTlvEvent ("HNMP_TLV_HANDLE", NmsTlv::TYPE_ROUTE_FAIL_041,
-                                   "flowId=" + std::to_string (fail.flowId) +
-                                   " faultNodeId=" + std::to_string (static_cast<uint32_t> (fail.faultNodeId)) +
-                                   " failReason=" + std::to_string (static_cast<uint32_t> (fail.failReason)));
+              LogStandardTlvEvent ("HNMP_TLV_RX", NmsTlv::TYPE_LINK_LOSS_032, rx.str ());
+              NmsTlv::LinkLoss032 loss = {};
+              if (NmsTlv::ParseLinkLoss032 (tlv, tlvLen, &loss) > 0)
+                {
+                  LinkMetricState& lm = m_linkMetricStates[loss.reporterNodeId];
+                  lm.reporterNodeId = loss.reporterNodeId;
+                  lm.lossPct = loss.lossPct;
+                  lm.upNeighbors = loss.peerCount;
+                  lm.lastTs = Simulator::Now ().GetSeconds ();
+                  LogStandardTlvEvent ("HNMP_TLV_HANDLE", NmsTlv::TYPE_LINK_LOSS_032,
+                                       "nodeId=" + std::to_string (static_cast<uint32_t> (loss.reporterNodeId)) +
+                                       " lossPct=" + std::to_string (loss.lossPct));
+                }
             }
-          uint8_t frameOut[64];
-          uint32_t frameLen = BuildHnmpFrame (Hnmp::FRAME_ALERT, 1, 0, buf, payloadLen, frameOut, sizeof (frameOut));
-          if (frameLen > 0 && m_socket)
+          else if (tlv[0] == NmsTlv::TYPE_LINK_STATUS_033)
             {
-              m_socket->Send (Create<Packet> (frameOut, frameLen));
-              NmsPacketParse::LogDataPacket (GetNode ()->GetId (), "SEND", Ipv4Address ("0.0.0.0"), m_gmcBackhaulAddress, 0, m_gmcBackhaulPort, frameOut, frameLen);
-              std::ostringstream tx;
-              tx << "forward_to_gmc dst=" << m_gmcBackhaulAddress;
-              LogStandardTlvEvent ("HNMP_TLV_TX", NmsTlv::TYPE_ROUTE_FAIL_041, tx.str ());
+              LogStandardTlvEvent ("HNMP_TLV_RX", NmsTlv::TYPE_LINK_STATUS_033, rx.str ());
+              NmsTlv::LinkStatus033 status = {};
+              if (NmsTlv::ParseLinkStatus033 (tlv, tlvLen, &status) > 0)
+                {
+                  LinkMetricState& lm = m_linkMetricStates[status.reporterNodeId];
+                  lm.reporterNodeId = status.reporterNodeId;
+                  lm.linkState = status.linkState;
+                  lm.upNeighbors = status.upNeighbors;
+                  lm.lastTs = Simulator::Now ().GetSeconds ();
+                  LogStandardTlvEvent ("HNMP_TLV_HANDLE", NmsTlv::TYPE_LINK_STATUS_033,
+                                       "nodeId=" + std::to_string (static_cast<uint32_t> (status.reporterNodeId)) +
+                                       " linkState=" + std::to_string (static_cast<uint32_t> (status.linkState)));
+                }
             }
+          else if (tlv[0] == NmsTlv::TYPE_FAULT_040)
+            {
+              LogStandardTlvEvent ("HNMP_TLV_RX", NmsTlv::TYPE_FAULT_040, rx.str ());
+              NmsTlv::Alert040 alert = {};
+              if (NmsTlv::ParseAlert040 (tlv, tlvLen, &alert) > 0)
+                {
+                  LogStandardTlvEvent ("HNMP_TLV_HANDLE", NmsTlv::TYPE_FAULT_040,
+                                       "reporter=" + std::to_string (static_cast<uint32_t> (alert.reportNodeId)) +
+                                       " target=" + std::to_string (static_cast<uint32_t> (alert.targetNodeId)) +
+                                       " level=" + std::to_string (static_cast<uint32_t> (alert.alertLevel)) +
+                                       " reason=" + std::to_string (static_cast<uint32_t> (alert.alertReason)));
+                }
+              uint8_t frameOut[64];
+              uint32_t frameLen = BuildHnmpFrame (Hnmp::FRAME_ALERT, 1, 0, tlv, tlvLen, frameOut, sizeof (frameOut));
+              if (frameLen > 0 && m_socket)
+                {
+                  m_socket->Send (Create<Packet> (frameOut, frameLen));
+                  NmsPacketParse::LogDataPacket (GetNode ()->GetId (), "SEND", Ipv4Address ("0.0.0.0"), m_gmcBackhaulAddress, 0, m_gmcBackhaulPort, frameOut, frameLen);
+                  std::ostringstream tx;
+                  tx << "forward_to_gmc dst=" << m_gmcBackhaulAddress;
+                  LogStandardTlvEvent ("HNMP_TLV_TX", NmsTlv::TYPE_FAULT_040, tx.str ());
+                }
+            }
+          else if (tlv[0] == NmsTlv::TYPE_ROUTE_FAIL_041)
+            {
+              LogStandardTlvEvent ("HNMP_TLV_RX", NmsTlv::TYPE_ROUTE_FAIL_041, rx.str ());
+              NmsTlv::RouteFail041 fail = {};
+              if (NmsTlv::ParseRouteFail041 (tlv, tlvLen, &fail) > 0)
+                {
+                  LogStandardTlvEvent ("HNMP_TLV_HANDLE", NmsTlv::TYPE_ROUTE_FAIL_041,
+                                       "flowId=" + std::to_string (fail.flowId) +
+                                       " faultNodeId=" + std::to_string (static_cast<uint32_t> (fail.faultNodeId)) +
+                                       " failReason=" + std::to_string (static_cast<uint32_t> (fail.failReason)));
+                }
+              uint8_t frameOut[64];
+              uint32_t frameLen = BuildHnmpFrame (Hnmp::FRAME_ALERT, 1, 0, tlv, tlvLen, frameOut, sizeof (frameOut));
+              if (frameLen > 0 && m_socket)
+                {
+                  m_socket->Send (Create<Packet> (frameOut, frameLen));
+                  NmsPacketParse::LogDataPacket (GetNode ()->GetId (), "SEND", Ipv4Address ("0.0.0.0"), m_gmcBackhaulAddress, 0, m_gmcBackhaulPort, frameOut, frameLen);
+                  std::ostringstream tx;
+                  tx << "forward_to_gmc dst=" << m_gmcBackhaulAddress;
+                  LogStandardTlvEvent ("HNMP_TLV_TX", NmsTlv::TYPE_ROUTE_FAIL_041, tx.str ());
+                }
+            }
+
+          off += tlvLen;
         }
 
       // 旧 TYPE_NODE_REPORT_SPN 兼容路径保留，但论文主路径优先使用 0x10/0x15/0x40。
-
     }
 }
 
@@ -4589,6 +4854,13 @@ HeterogeneousNodeApp::RecvPolicy (Ptr<Socket> socket)
                   uint32_t tlvLen = NmsTlv::BuildExecCmd014Payload (tlvBuf, sizeof (tlvBuf), cmd);
                   if (tlvLen > 0)
                     {
+                      std::ostringstream build14;
+                      build14 << "intentId=" << static_cast<uint32_t> (cmd.intentId)
+                              << " cmdSeq=" << static_cast<uint32_t> (cmd.cmdSeq)
+                              << " targetNodeId=" << static_cast<uint32_t> (cmd.targetNodeId)
+                              << " cmdType=" << static_cast<uint32_t> (cmd.cmdType)
+                              << " cmdParam=" << cmd.cmdParam;
+                      LogStandardTlvEvent ("HNMP_TLV_BUILD", NmsTlv::TYPE_EXEC_CMD_014, build14.str ());
                       payloadBuf.assign (tlvBuf, tlvBuf + tlvLen);
                       IntentExecState& st = m_intentExecStates[intent.intentId];
                       st.totalTargets = 1;
@@ -4615,6 +4887,12 @@ HeterogeneousNodeApp::RecvPolicy (Ptr<Socket> socket)
                     {
                       m_policySocket->SendTo (fwd, 0, InetSocketAddress (dstAddr, m_nodePolicyPort));
                       NmsPacketParse::LogDataPacket (nodeId, "SEND", Ipv4Address ("0.0.0.0"), dstAddr, 0, m_nodePolicyPort, frameBuf, frameLen);
+                      std::ostringstream tx14;
+                      tx14 << "dst=" << dstAddr << ":" << m_nodePolicyPort
+                           << " intentId=" << static_cast<uint32_t> (cmd.intentId)
+                           << " cmdSeq=" << static_cast<uint32_t> (cmd.cmdSeq)
+                           << " targetNodeId=" << static_cast<uint32_t> (cmd.targetNodeId);
+                      LogStandardTlvEvent ("HNMP_TLV_TX", NmsTlv::TYPE_EXEC_CMD_014, tx14.str ());
                     }
                 }
             }
@@ -4623,6 +4901,16 @@ HeterogeneousNodeApp::RecvPolicy (Ptr<Socket> socket)
               InetSocketAddress dst = InetSocketAddress (m_subnetBroadcast, m_nodePolicyPort);
               m_policySocket->SendTo (fwd, 0, dst);
               NmsPacketParse::LogDataPacket (nodeId, "SEND", Ipv4Address ("0.0.0.0"), m_subnetBroadcast, 0, m_nodePolicyPort, frameBuf, frameLen);
+              NmsTlv::ExecCmd014 cmd = {};
+              if (NmsTlv::ParseExecCmd014 (payloadBuf.data (), payloadBuf.size (), &cmd) > 0)
+                {
+                  std::ostringstream tx14;
+                  tx14 << "dst=" << m_subnetBroadcast << ":" << m_nodePolicyPort
+                       << " intentId=" << static_cast<uint32_t> (cmd.intentId)
+                       << " cmdSeq=" << static_cast<uint32_t> (cmd.cmdSeq)
+                       << " targetNodeId=" << static_cast<uint32_t> (cmd.targetNodeId);
+                  LogStandardTlvEvent ("HNMP_TLV_TX", NmsTlv::TYPE_EXEC_CMD_014, tx14.str ());
+                }
             }
         }
     }
@@ -4640,67 +4928,102 @@ HeterogeneousNodeApp::FlushAggregatedToGmc ()
   uint8_t outBuf[8192];
   uint32_t offset = 0;
 
-  // 构建 TYPE_TOPOLOGY_AGGREGATE：节点状态列表 + 子网拓扑边
-  const uint32_t maxPayload = 8192 - 3;
-  if (m_subnetNodeStates.empty () && m_aggregateBuf.empty ())
+  if (m_subnetNodeStates.empty () && m_aggregateBuf.empty () && m_flowPerfStates.empty () && m_linkMetricStates.empty ())
     {
       m_flushEvent = Simulator::Schedule (m_aggregateInterval,
                                           &HeterogeneousNodeApp::FlushAggregatedToGmc, this);
       return;
     }
 
-  // 先写入 TLV 头，Value = [n_nodes(2)][node_reports...][n_edges(2)][edges...]
-  offset = 3;  // 预留 TLV 头
-  uint16_t nNodes = static_cast<uint16_t> (m_subnetNodeStates.size ());
-  if (offset + 2 + nNodes * (4 + 24 + 12 + 8 + 8 + 2 + 64 * 4) + 2 + m_subnetEdges.size () * 8 > maxPayload)
-    nNodes = 0;
-  outBuf[offset++] = (nNodes >> 8) & 0xff;
-  outBuf[offset++] = nNodes & 0xff;
-  uint16_t nWritten = 0;
-  for (const auto& kv : m_subnetNodeStates)
+  double sumThr = 0.0;
+  double sumDelay = 0.0;
+  double sumLoss = 0.0;
+  uint32_t flowCount = 0;
+  uint32_t highPrioCount = 0;
+  uint32_t mediumPrioCount = 0;
+  for (const auto& kv : m_flowPerfStates)
     {
-      if (nWritten >= nNodes) break;
-      const NodeReportState& st = kv.second;
-      if (offset + 4 + 24 + 12 + 8 + 8 + 2 + st.neighborIds.size () * 4 > maxPayload) break;
-      outBuf[offset++] = (st.nodeId >> 24) & 0xff; outBuf[offset++] = (st.nodeId >> 16) & 0xff;
-      outBuf[offset++] = (st.nodeId >> 8) & 0xff;  outBuf[offset++] = st.nodeId & 0xff;
-      std::memcpy (outBuf + offset, &st.px, 8); offset += 8;
-      std::memcpy (outBuf + offset, &st.py, 8); offset += 8;
-      std::memcpy (outBuf + offset, &st.pz, 8); offset += 8;
-      std::memcpy (outBuf + offset, &st.vx, 4); offset += 4;
-      std::memcpy (outBuf + offset, &st.vy, 4); offset += 4;
-      std::memcpy (outBuf + offset, &st.vz, 4); offset += 4;
-      std::memcpy (outBuf + offset, &st.energy, 8); offset += 8;
-      std::memcpy (outBuf + offset, &st.linkQ, 8); offset += 8;
-      uint16_t n = static_cast<uint16_t> (st.neighborIds.size ());
-      outBuf[offset++] = (n >> 8) & 0xff; outBuf[offset++] = n & 0xff;
-      for (uint32_t nid : st.neighborIds)
+      const FlowPerfState& s = kv.second;
+      sumThr += s.throughputMbps;
+      sumDelay += s.delayMs;
+      sumLoss += s.lossPct;
+      flowCount++;
+      if (s.priority >= 2)
         {
-          outBuf[offset++] = (nid >> 24) & 0xff; outBuf[offset++] = (nid >> 16) & 0xff;
-          outBuf[offset++] = (nid >> 8) & 0xff;  outBuf[offset++] = nid & 0xff;
+          highPrioCount++;
         }
-      nWritten++;
+      else if (s.priority == 1)
+        {
+          mediumPrioCount++;
+        }
     }
-  outBuf[3] = (nWritten >> 8) & 0xff;
-  outBuf[4] = nWritten & 0xff;
-  uint16_t nEdges = static_cast<uint16_t> (m_subnetEdges.size ());
-  outBuf[offset++] = (nEdges >> 8) & 0xff;
-  outBuf[offset++] = nEdges & 0xff;
-  for (const auto& e : m_subnetEdges)
+  if (flowCount > 0)
     {
-      uint32_t a = e.first, b = e.second;
-      outBuf[offset++] = (a >> 24) & 0xff; outBuf[offset++] = (a >> 16) & 0xff;
-      outBuf[offset++] = (a >> 8) & 0xff;  outBuf[offset++] = a & 0xff;
-      outBuf[offset++] = (b >> 24) & 0xff; outBuf[offset++] = (b >> 16) & 0xff;
-      outBuf[offset++] = (b >> 8) & 0xff;  outBuf[offset++] = b & 0xff;
+      NmsTlv::FlowAgg021 agg = {};
+      agg.subnetType = static_cast<uint8_t> (m_subnetType);
+      agg.flowCount = static_cast<uint8_t> (std::min<uint32_t> (255, flowCount));
+      agg.highPrioCount = static_cast<uint8_t> (std::min<uint32_t> (255, highPrioCount));
+      agg.mediumPrioCount = static_cast<uint8_t> (std::min<uint32_t> (255, mediumPrioCount));
+      agg.avgThroughputMbps = sumThr / static_cast<double> (flowCount);
+      agg.avgDelayMs = sumDelay / static_cast<double> (flowCount);
+      agg.avgLossPct = sumLoss / static_cast<double> (flowCount);
+      uint32_t tlvLen = NmsTlv::BuildFlowAgg021Payload (outBuf + offset, sizeof (outBuf) - offset, agg);
+      if (tlvLen > 0)
+        {
+          offset += tlvLen;
+          std::ostringstream oss;
+          oss << "subnetType=" << static_cast<uint32_t> (agg.subnetType)
+              << " flowCount=" << static_cast<uint32_t> (agg.flowCount)
+              << " highPrioCount=" << static_cast<uint32_t> (agg.highPrioCount)
+              << " mediumPrioCount=" << static_cast<uint32_t> (agg.mediumPrioCount)
+              << " avgThroughputMbps=" << agg.avgThroughputMbps
+              << " avgDelayMs=" << agg.avgDelayMs
+              << " avgLossPct=" << agg.avgLossPct;
+          LogStandardTlvEvent ("HNMP_TLV_BUILD", NmsTlv::TYPE_FLOW_AGG_021, oss.str ());
+        }
     }
 
-  uint16_t valLen = offset - 3;
-  outBuf[0] = NmsTlv::TYPE_TOPOLOGY_AGGREGATE;
-  outBuf[1] = (valLen >> 8) & 0xff;
-  outBuf[2] = valLen & 0xff;
+  double sumLinkQ = 0.0;
+  double sumLinkLoss = 0.0;
+  uint32_t metricCount = 0;
+  uint32_t upLinks = 0;
+  uint32_t activeLinks = 0;
+  for (const auto& kv : m_linkMetricStates)
+    {
+      const LinkMetricState& s = kv.second;
+      sumLinkQ += s.linkQuality;
+      sumLinkLoss += s.lossPct;
+      metricCount++;
+      activeLinks += s.upNeighbors;
+      if (s.linkState != 0)
+        {
+          upLinks += s.upNeighbors;
+        }
+    }
+  if (metricCount > 0)
+    {
+      NmsTlv::LinkAgg034 agg = {};
+      agg.subnetType = static_cast<uint8_t> (m_subnetType);
+      agg.reporterCount = static_cast<uint8_t> (std::min<uint32_t> (255, metricCount));
+      agg.activeLinks = static_cast<uint8_t> (std::min<uint32_t> (255, activeLinks));
+      agg.upLinks = static_cast<uint8_t> (std::min<uint32_t> (255, upLinks));
+      agg.avgLinkQuality = sumLinkQ / static_cast<double> (metricCount);
+      agg.avgLossPct = sumLinkLoss / static_cast<double> (metricCount);
+      uint32_t tlvLen = NmsTlv::BuildLinkAgg034Payload (outBuf + offset, sizeof (outBuf) - offset, agg);
+      if (tlvLen > 0)
+        {
+          offset += tlvLen;
+          std::ostringstream oss;
+          oss << "subnetType=" << static_cast<uint32_t> (agg.subnetType)
+              << " reporterCount=" << static_cast<uint32_t> (agg.reporterCount)
+              << " activeLinks=" << static_cast<uint32_t> (agg.activeLinks)
+              << " upLinks=" << static_cast<uint32_t> (agg.upLinks)
+              << " avgLinkQuality=" << agg.avgLinkQuality
+              << " avgLossPct=" << agg.avgLossPct;
+          LogStandardTlvEvent ("HNMP_TLV_BUILD", NmsTlv::TYPE_LINK_AGG_034, oss.str ());
+        }
+    }
 
-  // SPN 增量聚合：无变化时跳过重复发送
   uint32_t currHash = 2166136261u;
   for (uint32_t i = 0; i < offset; ++i)
     {
@@ -4710,13 +5033,16 @@ HeterogeneousNodeApp::FlushAggregatedToGmc ()
   double nowSec = Simulator::Now ().GetSeconds ();
   bool aggregateChanged = (currHash != m_lastAggregateHash);
   bool forceBySilent = (m_lastAggregateSendTs < 0.0) || ((nowSec - m_lastAggregateSendTs) >= m_maxSilentSec);
-  if (!aggregateChanged && !forceBySilent)
+  if ((offset == 0) || (!aggregateChanged && !forceBySilent))
     {
-      m_aggregateSuppressedCount++;
-      std::ostringstream dec;
-      dec << "action=SKIP reason=NO_TOPOLOGY_DELTA sinceLastAgg=" << std::fixed << std::setprecision (3)
-          << (nowSec - m_lastAggregateSendTs);
-      NMS_LOG_INFO (nodeId, "DECISION", dec.str ());
+      if (offset > 0)
+        {
+          m_aggregateSuppressedCount++;
+          std::ostringstream dec;
+          dec << "action=SKIP reason=NO_AGG_DELTA sinceLastAgg=" << std::fixed << std::setprecision (3)
+              << (nowSec - m_lastAggregateSendTs);
+          NMS_LOG_INFO (nodeId, "DECISION", dec.str ());
+        }
       m_flushEvent = Simulator::Schedule (m_aggregateInterval,
                                           &HeterogeneousNodeApp::FlushAggregatedToGmc, this);
       return;
@@ -4736,23 +5062,24 @@ HeterogeneousNodeApp::FlushAggregatedToGmc ()
   m_lastAggregateSendTs = nowSec;
   m_aggregateRawBytes += offset;
   m_aggregateSentBytes += frameLen;
+  NmsPacketParse::LogDataPacket (nodeId, "SEND", Ipv4Address ("0.0.0.0"), m_gmcBackhaulAddress, 0, m_gmcBackhaulPort, frameBuf, frameLen);
 
-  NMS_LOG_INFO (nodeId, "SPN_TO_GMC", "SPN " + std::to_string (nodeId) + " sending aggregated data to GMC 0");
-
-  std::ostringstream oss;
-  oss << "topology aggregate: " << m_subnetNodeStates.size () << " nodes, "
-      << m_subnetEdges.size () << " edges, size=" << offset << "B";
-  NMS_LOG_INFO (nodeId, "PROXY_AGGREGATE", oss.str ());
-  {
-    double compression = (offset > 0) ? (100.0 * (1.0 - static_cast<double> (frameLen) / static_cast<double> (offset))) : 0.0;
-    std::ostringstream eff;
-    eff << "mode=" << (aggregateChanged ? "DELTA" : "FAILSAFE")
-        << " rawBytes=" << offset
-        << " sentBytes=" << frameLen
-        << " compression=" << std::fixed << std::setprecision (2) << compression
-        << "% suppressedCount=" << m_aggregateSuppressedCount;
-    NMS_LOG_INFO (nodeId, "AGG_EFFICIENCY", eff.str ());
-  }
+  const uint8_t* p = outBuf;
+  uint32_t remain = offset;
+  while (remain >= 3)
+    {
+      uint16_t tlvValLen = (static_cast<uint16_t> (p[1]) << 8) | p[2];
+      uint32_t tlvLen = 3u + tlvValLen;
+      if (tlvLen > remain)
+        {
+          break;
+        }
+      std::ostringstream tx;
+      tx << "dst=" << m_gmcBackhaulAddress << ":" << m_gmcBackhaulPort << " bytes=" << tlvLen;
+      LogStandardTlvEvent ("HNMP_TLV_TX", p[0], tx.str ());
+      p += tlvLen;
+      remain -= tlvLen;
+    }
 
   m_flushEvent = Simulator::Schedule (m_aggregateInterval,
                                       &HeterogeneousNodeApp::FlushAggregatedToGmc, this);
@@ -4798,6 +5125,17 @@ HeterogeneousNodeApp::HandlePolicyFromSpn (Ptr<Socket> socket)
           EmitRouteFail041 (0, 2, "parse_cmd014_failed", false);
           continue;
         }
+      {
+        std::ostringstream rx14;
+        rx14 << "src=" << replyAddr << " dst=node:" << nodeId
+             << " intentId=" << static_cast<uint32_t> (cmd.intentId)
+             << " cmdSeq=" << static_cast<uint32_t> (cmd.cmdSeq)
+             << " targetNodeId=" << static_cast<uint32_t> (cmd.targetNodeId)
+             << " cmdType=" << static_cast<uint32_t> (cmd.cmdType)
+             << " cmdParam=" << cmd.cmdParam;
+        LogStandardTlvEvent ("HNMP_TLV_RX", NmsTlv::TYPE_EXEC_CMD_014, rx14.str ());
+        LogStandardTlvEvent ("HNMP_TLV_HANDLE", NmsTlv::TYPE_EXEC_CMD_014, rx14.str ());
+      }
 
       // 仅目标节点执行；非目标节点忽略
       if (cmd.targetNodeId != 0xFF && cmd.targetNodeId != static_cast<uint8_t> (nodeId & 0xffu))
@@ -5347,45 +5685,164 @@ HeterogeneousNodeApp::SendPacket ()
   };
   auto buildUvMibMultiTlv = [this, nodeId, &tlvBuf] () -> uint32_t {
     uint32_t off = 0;
-    UvMibConfigIntentModel cfg = {};
-    cfg.role = m_isSpn ? 1 : 2;  // 1=SPN, 2=TSN
-    cfg.subnetType = static_cast<uint8_t> (m_subnetType);
-    cfg.qosIntent = (m_subnetType == SUBNET_DATALINK) ? 0 : 1;
-    off += SerializeUvMibConfigIntent (cfg, tlvBuf + off, sizeof (tlvBuf) - off);
 
-    UvMibBusinessPerfModel biz = {};
-    biz.flowId = 1;
-    biz.priority = (m_subnetType == SUBNET_DATALINK) ? 0 : 1;
-    biz.throughputMbps = std::max (0.0, m_uvMib.m_linkQuality * 2.0);
-    biz.delayMs = (1.0 - m_uvMib.m_linkQuality) * 150.0;
-    biz.lossPct = std::max (0.0, (1.0 - m_uvMib.m_linkQuality) * 10.0);
-    off += SerializeUvMibBusinessPerf (biz, tlvBuf + off, sizeof (tlvBuf) - off);
+    NmsTlv::Telemetry010 telemetry = {};
+    telemetry.nodeId = static_cast<uint8_t> (nodeId & 0xffu);
+    telemetry.batteryLevel = static_cast<uint8_t> (std::max (0.0, std::min (255.0, std::round (m_uvMib.m_energy * 255.0))));
+    Ptr<MobilityModel> mob = GetNode ()->GetObject<MobilityModel> ();
+    if (mob)
+      {
+        Vector pos = mob->GetPosition ();
+        telemetry.posX = static_cast<float> (pos.x);
+        telemetry.posY = static_cast<float> (pos.y);
+        telemetry.posZ = static_cast<float> (pos.z);
+        Vector vel = mob->GetVelocity ();
+        telemetry.vx = static_cast<float> (vel.x);
+        telemetry.vy = static_cast<float> (vel.y);
+        telemetry.vz = static_cast<float> (vel.z);
+      }
+    uint32_t len010 = NmsTlv::BuildTelemetry010Payload (tlvBuf + off, sizeof (tlvBuf) - off, telemetry);
+    if (len010 > 0)
+      {
+        off += len010;
+        std::ostringstream oss;
+        oss << "nodeId=" << static_cast<uint32_t> (telemetry.nodeId)
+            << " batteryLevel=" << static_cast<uint32_t> (telemetry.batteryLevel);
+        LogStandardTlvEvent ("HNMP_TLV_BUILD", NmsTlv::TYPE_TELEMETRY_010, oss.str ());
+      }
 
-    UvMibRouteTopoModel topo = {};
-    topo.neighborCount = static_cast<uint16_t> (m_neighborScores.size ());
+    NmsTlv::Subnet012 subnet = {};
+    subnet.reporterNodeId = static_cast<uint8_t> (nodeId & 0xffu);
+    subnet.subnetType = static_cast<uint8_t> (m_subnetType);
+    subnet.qosIntent = (m_subnetType == SUBNET_DATALINK) ? 0 : 1;
+    subnet.reserve = GetRoleTypeCode (m_isSpn, m_isBackupSpn);
+    uint32_t len012 = NmsTlv::BuildSubnet012Payload (tlvBuf + off, sizeof (tlvBuf) - off, subnet);
+    if (len012 > 0)
+      {
+        off += len012;
+        std::ostringstream oss;
+        oss << "nodeId=" << static_cast<uint32_t> (subnet.reporterNodeId)
+            << " subnetType=" << static_cast<uint32_t> (subnet.subnetType)
+            << " qosIntent=" << static_cast<uint32_t> (subnet.qosIntent)
+            << " roleCode=" << static_cast<uint32_t> (subnet.reserve);
+        LogStandardTlvEvent ("HNMP_TLV_BUILD", NmsTlv::TYPE_SUBNET_012, oss.str ());
+      }
+
+    NmsTlv::Flow020 flow = {};
+    flow.reporterNodeId = static_cast<uint8_t> (nodeId & 0xffu);
+    flow.flowId = 1;
+    flow.priority = (m_subnetType == SUBNET_DATALINK) ? 0 : 1;
+    flow.throughputMbps = std::max (0.0, m_uvMib.m_linkQuality * 2.0);
+    flow.delayMs = (1.0 - m_uvMib.m_linkQuality) * 150.0;
+    flow.lossPct = std::max (0.0, (1.0 - m_uvMib.m_linkQuality) * 10.0);
+    uint32_t len020 = NmsTlv::BuildFlow020Payload (tlvBuf + off, sizeof (tlvBuf) - off, flow);
+    if (len020 > 0)
+      {
+        off += len020;
+        std::ostringstream oss;
+        oss << "nodeId=" << static_cast<uint32_t> (flow.reporterNodeId)
+            << " flowId=" << flow.flowId
+            << " priority=" << static_cast<uint32_t> (flow.priority)
+            << " throughputMbps=" << flow.throughputMbps
+            << " delayMs=" << flow.delayMs
+            << " lossPct=" << flow.lossPct;
+        LogStandardTlvEvent ("HNMP_TLV_BUILD", NmsTlv::TYPE_FLOW_020, oss.str ());
+      }
+
+    NmsTlv::Topo030 topo = {};
+    topo.reporterNodeId = static_cast<uint8_t> (nodeId & 0xffu);
+    topo.neighborCount = static_cast<uint8_t> (std::min<size_t> (255, m_neighborScores.size ()));
     topo.avgLinkQuality = m_uvMib.m_linkQuality;
     topo.routeCost = static_cast<uint16_t> (std::max (1.0, 100.0 * (1.0 - m_uvMib.m_linkQuality)));
     topo.macRetry = static_cast<uint16_t> (std::max (0.0, 10.0 * (1.0 - m_uvMib.m_linkQuality)));
-    off += SerializeUvMibRouteTopo (topo, tlvBuf + off, sizeof (tlvBuf) - off);
-
-    if (m_uvMib.m_energy < 0.2 && off + 14 < sizeof (tlvBuf))
+    uint32_t len030 = NmsTlv::BuildTopo030Payload (tlvBuf + off, sizeof (tlvBuf) - off, topo);
+    if (len030 > 0)
       {
-        UvMibFaultAlarmModel fault = {};
-        fault.faultType = 1;  // low energy
-        fault.severity = 2;   // warning
-        fault.code = 1001;
-        fault.faultTs = Simulator::Now ().GetSeconds ();
-        off += SerializeUvMibFaultAlarm (fault, tlvBuf + off, sizeof (tlvBuf) - off);
-        if (!m_lowEnergyAlarmRaised)
+        off += len030;
+        std::ostringstream oss;
+        oss << "nodeId=" << static_cast<uint32_t> (topo.reporterNodeId)
+            << " neighborCount=" << static_cast<uint32_t> (topo.neighborCount)
+            << " avgLinkQuality=" << topo.avgLinkQuality
+            << " routeCost=" << topo.routeCost
+            << " macRetry=" << topo.macRetry;
+        LogStandardTlvEvent ("HNMP_TLV_BUILD", NmsTlv::TYPE_TOPO_030, oss.str ());
+      }
+
+    NmsTlv::Link031 link = {};
+    link.reporterNodeId = static_cast<uint8_t> (nodeId & 0xffu);
+    link.metricType = 1;
+    link.linkQuality = m_uvMib.m_linkQuality;
+    uint32_t len031 = NmsTlv::BuildLink031Payload (tlvBuf + off, sizeof (tlvBuf) - off, link);
+    if (len031 > 0)
+      {
+        off += len031;
+        std::ostringstream oss;
+        oss << "nodeId=" << static_cast<uint32_t> (link.reporterNodeId)
+            << " metricType=" << static_cast<uint32_t> (link.metricType)
+            << " linkQualityProxy=" << link.linkQuality;
+        LogStandardTlvEvent ("HNMP_TLV_BUILD", NmsTlv::TYPE_LINK_031, oss.str ());
+      }
+
+    NmsTlv::LinkLoss032 loss = {};
+    loss.reporterNodeId = static_cast<uint8_t> (nodeId & 0xffu);
+    loss.peerCount = static_cast<uint8_t> (std::min<size_t> (255, m_neighborScores.size ()));
+    loss.lossPct = std::max (0.0, (1.0 - m_uvMib.m_linkQuality) * 10.0);
+    uint32_t len032 = NmsTlv::BuildLinkLoss032Payload (tlvBuf + off, sizeof (tlvBuf) - off, loss);
+    if (len032 > 0)
+      {
+        off += len032;
+        std::ostringstream oss;
+        oss << "nodeId=" << static_cast<uint32_t> (loss.reporterNodeId)
+            << " peerCount=" << static_cast<uint32_t> (loss.peerCount)
+            << " lossPct=" << loss.lossPct;
+        LogStandardTlvEvent ("HNMP_TLV_BUILD", NmsTlv::TYPE_LINK_LOSS_032, oss.str ());
+      }
+
+    NmsTlv::LinkStatus033 status = {};
+    status.reporterNodeId = static_cast<uint8_t> (nodeId & 0xffu);
+    status.linkState = (m_uvMib.m_linkQuality >= 0.35) ? 1 : 0;
+    status.upNeighbors = topo.neighborCount;
+    status.reserve = 0;
+    uint32_t len033 = NmsTlv::BuildLinkStatus033Payload (tlvBuf + off, sizeof (tlvBuf) - off, status);
+    if (len033 > 0)
+      {
+        off += len033;
+        std::ostringstream oss;
+        oss << "nodeId=" << static_cast<uint32_t> (status.reporterNodeId)
+            << " linkState=" << static_cast<uint32_t> (status.linkState)
+            << " upNeighbors=" << static_cast<uint32_t> (status.upNeighbors);
+        LogStandardTlvEvent ("HNMP_TLV_BUILD", NmsTlv::TYPE_LINK_STATUS_033, oss.str ());
+      }
+
+    if (m_uvMib.m_energy < 0.2 && off + NmsTlv::ALERT_040_TLV_LEN < sizeof (tlvBuf))
+      {
+        NmsTlv::Alert040 alert = {};
+        alert.reportNodeId = static_cast<uint8_t> (nodeId & 0xffu);
+        alert.targetNodeId = static_cast<uint8_t> (nodeId & 0xffu);
+        alert.alertLevel = 2;
+        alert.alertReason = 1;
+        uint32_t len040 = NmsTlv::BuildAlert040Payload (tlvBuf + off, sizeof (tlvBuf) - off, alert);
+        if (len040 > 0)
           {
-            NMS_LOG_INFO (nodeId, "FAULT_REPORT", "low energy alarm generated");
-            m_lowEnergyAlarmRaised = true;
+            off += len040;
+            std::ostringstream oss;
+            oss << "reporter=" << static_cast<uint32_t> (alert.reportNodeId)
+                << " target=" << static_cast<uint32_t> (alert.targetNodeId)
+                << " level=" << static_cast<uint32_t> (alert.alertLevel)
+                << " reason=" << static_cast<uint32_t> (alert.alertReason);
+            LogStandardTlvEvent ("HNMP_TLV_BUILD", NmsTlv::TYPE_FAULT_040, oss.str ());
+            if (!m_lowEnergyAlarmRaised)
+              {
+                NMS_LOG_INFO (nodeId, "FAULT_REPORT", "low energy alarm generated");
+                m_lowEnergyAlarmRaised = true;
+              }
           }
       }
     else if (m_uvMib.m_energy >= 0.3)
       {
         m_lowEnergyAlarmRaised = false;
       }
+
     return off;
   };
 
@@ -6850,75 +7307,203 @@ HeterogeneousNmsFramework::RecvAtGmc (Ptr<Socket> socket)
           continue;
         }
       NmsPacketParse::LogDataPacket (0, "RECV", src, Ipv4Address ("0.0.0.0"), iaddr.GetPort (), 8080, payload, payloadLen);
-      uint8_t type = payload[0];
-      auto logRx = [&] (uint8_t tlvType) {
-        std::ostringstream rx;
-        rx << "src=" << src << " bytes=" << payloadLen;
-        NmsLog ("INFO", 0, "HNMP_TLV_RX",
-                "stage=HNMP_TLV_RX type=0x" + [&](){ std::ostringstream s; s << std::hex << std::setw (2) << std::setfill ('0') << static_cast<uint32_t> (tlvType); return s.str(); }()
-                + " node=0 " + rx.str ());
-      };
-      auto logHandle = [&] (uint8_t tlvType, const std::string& details) {
-        std::ostringstream tag;
-        tag << "stage=HNMP_TLV_HANDLE type=0x" << std::hex << std::setw (2) << std::setfill ('0')
-            << static_cast<uint32_t> (tlvType) << std::dec << " node=0 " << details;
-        NmsLog ("INFO", 0, "HNMP_TLV_HANDLE", tag.str ());
-      };
-      if (type == NmsTlv::TYPE_ROLE_011)
+      uint32_t off = 0;
+      while (off + 3 <= payloadLen)
         {
-          logRx (type);
-          NmsTlv::Role011 role = {};
-          if (NmsTlv::ParseRole011 (payload, payloadLen, &role) > 0)
+          std::ostringstream srcOss;
+          srcOss << src;
+          const std::string srcStr = srcOss.str ();
+          uint8_t type = payload[off];
+          uint16_t valLen = (static_cast<uint16_t> (payload[off + 1]) << 8) | payload[off + 2];
+          uint32_t tlvLen = 3u + valLen;
+          if (off + tlvLen > payloadLen)
             {
-              logHandle (type, "nodeId=" + std::to_string (static_cast<uint32_t> (role.nodeId))
-                               + " roleType=" + std::to_string (static_cast<uint32_t> (role.roleType))
-                               + " computeLevel=" + std::to_string (static_cast<uint32_t> (role.computeLevel)));
+              break;
             }
-        }
-      else if (type == NmsTlv::TYPE_INTENT_REPORT_016)
-        {
-          logRx (type);
-          NmsTlv::IntentReport016 report = {};
-          if (NmsTlv::ParseIntentReport016 (payload, payloadLen, &report) > 0)
+          const uint8_t* tlv = payload + off;
+          auto logRx = [&] (uint8_t tlvType, const std::string& summary) {
+            RecordTlvLifecycleEvent ("HNMP_TLV_RX", tlvType, 0, srcStr, "gmc:8080", tlvLen, summary);
+            std::ostringstream rx;
+            rx << "stage=HNMP_TLV_RX type=" << FormatTlvHex (tlvType)
+               << " node=0 src=" << src << " dst=gmc:8080 bytes=" << tlvLen
+               << " " << summary;
+            NmsLog ("INFO", 0, "HNMP_TLV_RX", rx.str ());
+          };
+          auto logHandle = [&] (uint8_t tlvType, const std::string& summary) {
+            RecordTlvLifecycleEvent ("HNMP_TLV_HANDLE", tlvType, 0, srcStr, "gmc:8080", tlvLen, summary);
+            std::ostringstream hd;
+            hd << "stage=HNMP_TLV_HANDLE type=" << FormatTlvHex (tlvType)
+               << " node=0 src=" << src << " dst=gmc:8080 bytes=" << tlvLen
+               << " " << summary;
+            NmsLog ("INFO", 0, "HNMP_TLV_HANDLE", hd.str ());
+          };
+          if (type == NmsTlv::TYPE_ROLE_011)
             {
-              logHandle (type, "intentId=" + std::to_string (static_cast<uint32_t> (report.intentId))
-                               + " totalTargets=" + std::to_string (static_cast<uint32_t> (report.totalTargets))
-                               + " successCount=" + std::to_string (static_cast<uint32_t> (report.successCount))
-                               + " failCount=" + std::to_string (static_cast<uint32_t> (report.failCount)));
+              NmsTlv::Role011 role = {};
+              logRx (type, "role_status");
+              if (NmsTlv::ParseRole011 (tlv, tlvLen, &role) > 0)
+                {
+                  logHandle (type, "nodeId=" + std::to_string (static_cast<uint32_t> (role.nodeId)) +
+                                   " roleType=" + std::to_string (static_cast<uint32_t> (role.roleType)) +
+                                   " computeLevel=" + std::to_string (static_cast<uint32_t> (role.computeLevel)));
+                }
             }
-        }
-      else if (type == NmsTlv::TYPE_FAULT_040)
-        {
-          logRx (type);
-          NmsTlv::Alert040 alert = {};
-          if (NmsTlv::ParseAlert040 (payload, payloadLen, &alert) > 0)
+          else if (type == NmsTlv::TYPE_INTENT_REPORT_016)
             {
-              logHandle (type, "reporter=" + std::to_string (static_cast<uint32_t> (alert.reportNodeId))
-                               + " target=" + std::to_string (static_cast<uint32_t> (alert.targetNodeId))
-                               + " level=" + std::to_string (static_cast<uint32_t> (alert.alertLevel))
-                               + " reason=" + std::to_string (static_cast<uint32_t> (alert.alertReason)));
+              NmsTlv::IntentReport016 report = {};
+              logRx (type, "intent_report");
+              if (NmsTlv::ParseIntentReport016 (tlv, tlvLen, &report) > 0)
+                {
+                  logHandle (type, "intentId=" + std::to_string (static_cast<uint32_t> (report.intentId)) +
+                                   " totalTargets=" + std::to_string (static_cast<uint32_t> (report.totalTargets)) +
+                                   " successCount=" + std::to_string (static_cast<uint32_t> (report.successCount)) +
+                                   " failCount=" + std::to_string (static_cast<uint32_t> (report.failCount)));
+                }
             }
-        }
-      else if (type == NmsTlv::TYPE_ROUTE_FAIL_041)
-        {
-          logRx (type);
-          NmsTlv::RouteFail041 fail = {};
-          if (NmsTlv::ParseRouteFail041 (payload, payloadLen, &fail) > 0)
+          else if (type == NmsTlv::TYPE_FAULT_040)
             {
-              logHandle (type, "flowId=" + std::to_string (static_cast<uint32_t> (fail.flowId))
-                               + " faultNodeId=" + std::to_string (static_cast<uint32_t> (fail.faultNodeId))
-                               + " failReason=" + std::to_string (static_cast<uint32_t> (fail.failReason)));
+              NmsTlv::Alert040 alert = {};
+              logRx (type, "alert040");
+              if (NmsTlv::ParseAlert040 (tlv, tlvLen, &alert) > 0)
+                {
+                  logHandle (type, "reporter=" + std::to_string (static_cast<uint32_t> (alert.reportNodeId)) +
+                                   " target=" + std::to_string (static_cast<uint32_t> (alert.targetNodeId)) +
+                                   " level=" + std::to_string (static_cast<uint32_t> (alert.alertLevel)) +
+                                   " reason=" + std::to_string (static_cast<uint32_t> (alert.alertReason)));
+                }
             }
-        }
-      else if (type == NmsTlv::TYPE_TELEMETRY_010)
-        {
-          logRx (type);
-          NmsTlv::Telemetry010 t = {};
-          if (NmsTlv::ParseTelemetry010 (payload, payloadLen, &t) > 0)
+          else if (type == NmsTlv::TYPE_ROUTE_FAIL_041)
             {
-              logHandle (type, "nodeId=" + std::to_string (static_cast<uint32_t> (t.nodeId))
-                               + " batteryLevel=" + std::to_string (static_cast<uint32_t> (t.batteryLevel)));
+              NmsTlv::RouteFail041 fail = {};
+              logRx (type, "route_fail041");
+              if (NmsTlv::ParseRouteFail041 (tlv, tlvLen, &fail) > 0)
+                {
+                  logHandle (type, "flowId=" + std::to_string (static_cast<uint32_t> (fail.flowId)) +
+                                   " faultNodeId=" + std::to_string (static_cast<uint32_t> (fail.faultNodeId)) +
+                                   " failReason=" + std::to_string (static_cast<uint32_t> (fail.failReason)));
+                }
             }
+          else if (type == NmsTlv::TYPE_TELEMETRY_010)
+            {
+              NmsTlv::Telemetry010 t = {};
+              logRx (type, "telemetry010");
+              if (NmsTlv::ParseTelemetry010 (tlv, tlvLen, &t) > 0)
+                {
+                  logHandle (type, "nodeId=" + std::to_string (static_cast<uint32_t> (t.nodeId)) +
+                                   " batteryLevel=" + std::to_string (static_cast<uint32_t> (t.batteryLevel)));
+                }
+            }
+          else if (type == NmsTlv::TYPE_SUBNET_012)
+            {
+              logRx (type, "config_model");
+              if (valLen >= 4)
+                {
+                  const uint8_t nodeRole = tlv[3];
+                  const uint8_t subnetType = tlv[4];
+                  const uint8_t qosIntent = tlv[5];
+                  logHandle (type, "nodeId=0 subnetId=" + std::to_string (static_cast<uint32_t> (subnetType)) +
+                                   " roleCode=" + std::to_string (static_cast<uint32_t> (nodeRole)) +
+                                   " qosIntent=" + std::to_string (static_cast<uint32_t> (qosIntent)));
+                }
+            }
+          else if (type == NmsTlv::TYPE_FLOW_020)
+            {
+              logRx (type, "business_perf");
+              if (valLen >= 27)
+                {
+                  uint16_t flowId = (static_cast<uint16_t> (tlv[3]) << 8) | tlv[4];
+                  uint8_t priority = tlv[5];
+                  double throughputMbps = 0.0, delayMs = 0.0, lossPct = 0.0;
+                  std::memcpy (&throughputMbps, tlv + 6, 8);
+                  std::memcpy (&delayMs, tlv + 14, 8);
+                  std::memcpy (&lossPct, tlv + 22, 8);
+                  logHandle (type, "nodeId=0 flowId=" + std::to_string (flowId) +
+                                   " priority=" + std::to_string (static_cast<uint32_t> (priority)) +
+                                   " throughputMbps=" + std::to_string (throughputMbps) +
+                                   " delayMs=" + std::to_string (delayMs) +
+                                   " lossPct=" + std::to_string (lossPct));
+                }
+            }
+          else if (type == NmsTlv::TYPE_FLOW_AGG_021)
+            {
+              NmsTlv::FlowAgg021 agg = {};
+              logRx (type, "business_qos_agg");
+              if (NmsTlv::ParseFlowAgg021 (tlv, tlvLen, &agg) > 0)
+                {
+                  logHandle (type, "subnetType=" + std::to_string (static_cast<uint32_t> (agg.subnetType)) +
+                                   " flowCount=" + std::to_string (static_cast<uint32_t> (agg.flowCount)) +
+                                   " highPrioCount=" + std::to_string (static_cast<uint32_t> (agg.highPrioCount)) +
+                                   " mediumPrioCount=" + std::to_string (static_cast<uint32_t> (agg.mediumPrioCount)) +
+                                   " avgThroughputMbps=" + std::to_string (agg.avgThroughputMbps) +
+                                   " avgDelayMs=" + std::to_string (agg.avgDelayMs) +
+                                   " avgLossPct=" + std::to_string (agg.avgLossPct));
+                }
+            }
+          else if (type == NmsTlv::TYPE_TOPO_030)
+            {
+              logRx (type, "route_topology");
+              if (valLen >= 14)
+                {
+                  uint16_t neighborCount = (static_cast<uint16_t> (tlv[3]) << 8) | tlv[4];
+                  double avgLinkQuality = 0.0;
+                  std::memcpy (&avgLinkQuality, tlv + 5, 8);
+                  uint16_t routeCost = (static_cast<uint16_t> (tlv[13]) << 8) | tlv[14];
+                  uint16_t macRetry = (static_cast<uint16_t> (tlv[15]) << 8) | tlv[16];
+                  logHandle (type, "nodeId=0 neighborCount=" + std::to_string (neighborCount) +
+                                   " avgLinkQuality=" + std::to_string (avgLinkQuality) +
+                                   " routeCost=" + std::to_string (routeCost) +
+                                   " macRetry=" + std::to_string (macRetry));
+                }
+            }
+          else if (type == NmsTlv::TYPE_LINK_031)
+            {
+              NmsTlv::Link031 link = {};
+              logRx (type, "linkQualityProxy");
+              if (NmsTlv::ParseLink031 (tlv, tlvLen, &link) > 0)
+                {
+                  logHandle (type, "nodeId=" + std::to_string (static_cast<uint32_t> (link.reporterNodeId)) +
+                                   " linkQualityProxy=" + std::to_string (link.linkQuality) +
+                                   " metricType=" + std::to_string (static_cast<uint32_t> (link.metricType)) +
+                                   " note=proxy_metric_not_standard_link_quality");
+                }
+            }
+          else if (type == NmsTlv::TYPE_LINK_LOSS_032)
+            {
+              NmsTlv::LinkLoss032 loss = {};
+              logRx (type, "link_loss_rate");
+              if (NmsTlv::ParseLinkLoss032 (tlv, tlvLen, &loss) > 0)
+                {
+                  logHandle (type, "nodeId=" + std::to_string (static_cast<uint32_t> (loss.reporterNodeId)) +
+                                   " peerCount=" + std::to_string (static_cast<uint32_t> (loss.peerCount)) +
+                                   " lossPct=" + std::to_string (loss.lossPct));
+                }
+            }
+          else if (type == NmsTlv::TYPE_LINK_STATUS_033)
+            {
+              NmsTlv::LinkStatus033 status = {};
+              logRx (type, "link_status");
+              if (NmsTlv::ParseLinkStatus033 (tlv, tlvLen, &status) > 0)
+                {
+                  logHandle (type, "nodeId=" + std::to_string (static_cast<uint32_t> (status.reporterNodeId)) +
+                                   " linkState=" + std::to_string (static_cast<uint32_t> (status.linkState)) +
+                                   " upNeighbors=" + std::to_string (static_cast<uint32_t> (status.upNeighbors)));
+                }
+            }
+          else if (type == NmsTlv::TYPE_LINK_AGG_034)
+            {
+              NmsTlv::LinkAgg034 agg = {};
+              logRx (type, "link_agg_summary");
+              if (NmsTlv::ParseLinkAgg034 (tlv, tlvLen, &agg) > 0)
+                {
+                  logHandle (type, "subnetType=" + std::to_string (static_cast<uint32_t> (agg.subnetType)) +
+                                   " reporterCount=" + std::to_string (static_cast<uint32_t> (agg.reporterCount)) +
+                                   " activeLinks=" + std::to_string (static_cast<uint32_t> (agg.activeLinks)) +
+                                   " upLinks=" + std::to_string (static_cast<uint32_t> (agg.upLinks)) +
+                                   " avgLinkQuality=" + std::to_string (agg.avgLinkQuality) +
+                                   " avgLossPct=" + std::to_string (agg.avgLossPct));
+                }
+            }
+          off += tlvLen;
         }
     }
 }
@@ -8172,9 +8757,11 @@ HeterogeneousNmsFramework::WriteAllNodesJsonl ()
     uint32_t nodeId = node->GetId ();
     std::string joinState = "joined";
     double energy = 1.0, linkQ = 1.0;
+    std::string subnet = "unknown";
     auto it = m_joinConfig.find (nodeId);
     if (it != m_joinConfig.end ())
       {
+        subnet = it->second.subnet.empty () ? subnet : it->second.subnet;
         if (it->second.initialEnergy >= 0.0) energy = it->second.initialEnergy;
         if (it->second.initialLinkQuality >= 0.0) linkQ = it->second.initialLinkQuality;
         if (now < it->second.joinTime)
@@ -8241,6 +8828,7 @@ HeterogeneousNmsFramework::WriteAllNodesJsonl ()
         switch (app->GetSubnetType ())
           {
           case HeterogeneousNodeApp::SUBNET_ADHOC:
+            subnet = "adhoc";
             if (app->IsApplicationRunning ())
               {
                 chExtra << ",\"cluster_role\":\"" << (app->IsClusterHead () ? "CH" : "CM") << "\"";
@@ -8264,6 +8852,7 @@ HeterogeneousNmsFramework::WriteAllNodesJsonl ()
               }
             break;
           case HeterogeneousNodeApp::SUBNET_DATALINK:
+            subnet = "datalink";
             if (app->IsSpn ())
               {
                 role = "PRIMARY_SPN";
@@ -8278,6 +8867,7 @@ HeterogeneousNmsFramework::WriteAllNodesJsonl ()
               }
             break;
           case HeterogeneousNodeApp::SUBNET_LTE:
+            subnet = "lte";
             if (app->IsSpn ())
               {
                 role = "PRIMARY_SPN";
@@ -8316,6 +8906,10 @@ HeterogeneousNmsFramework::WriteAllNodesJsonl ()
               {
                 role = "TSN";
               }
+            if (!sub.empty ())
+              {
+                subnet = sub;
+              }
           }
       }
     std::string offlineExtra;
@@ -8326,6 +8920,21 @@ HeterogeneousNmsFramework::WriteAllNodesJsonl ()
       }
     WriteJsonlStateLine (nodeId, joinState, pos.x, pos.y, pos.z, ip, energy, linkQ, role,
                          chExtra.str () + offlineExtra);
+    if (g_uvMibSnapshotFile.is_open ())
+      {
+        g_uvMibSnapshotFile
+            << std::fixed << std::setprecision (6) << now << ","
+            << nodeId << ","
+            << subnet << ","
+            << role << ","
+            << joinState << ","
+            << std::setprecision (6) << energy << ","
+            << std::setprecision (6) << linkQ << ","
+            << std::setprecision (6) << pos.x << ","
+            << std::setprecision (6) << pos.y << ","
+            << std::setprecision (6) << pos.z
+            << std::endl;
+      }
   };
   // 必须写入所有节点组（含 LTE UE），否则日志只有 12 个节点、缺 12,13,14,15
   for (uint32_t i = 0; i < m_gmcNode.GetN (); ++i) writeOne (m_gmcNode.Get (i));
@@ -8333,6 +8942,10 @@ HeterogeneousNmsFramework::WriteAllNodesJsonl ()
   for (uint32_t i = 0; i < m_datalinkNodes.GetN (); ++i) writeOne (m_datalinkNodes.Get (i));
   for (uint32_t i = 0; i < m_lteEnbNodes.GetN (); ++i) writeOne (m_lteEnbNodes.Get (i));
   for (uint32_t i = 0; i < m_lteUeNodes.GetN (); ++i) writeOne (m_lteUeNodes.Get (i));
+  if (g_uvMibSnapshotFile.is_open ())
+    {
+      g_uvMibSnapshotFile.flush ();
+    }
   if (std::fabs (std::fmod (now, 5.0)) < 0.26)
     {
       std::ostringstream ad, dl, lte;
@@ -8503,6 +9116,29 @@ HeterogeneousNmsFramework::Run (double simTimeSeconds)
 
   std::string logPath = MakeOutputPathInCategory ("log", "nms-framework-log", ".txt");
   g_nmsLogFile.open (logPath.c_str (), std::ios::out);
+  std::string failoverCsvPath = m_dirPerformance + "/failover_events.csv";
+  g_failoverEventsFile.open (failoverCsvPath.c_str (), std::ios::out | std::ios::trunc);
+  if (g_failoverEventsFile.is_open ())
+    {
+      g_failoverEventsFile << "subnet,oldPrimaryId,newPrimaryId,backupId,reason,startTs,endTs,healDurationMs" << std::endl;
+      g_failoverEventsFile.flush ();
+    }
+  std::string uvMibCsvPath = m_dirLog + "/uv_mib_snapshot.csv";
+  g_uvMibSnapshotFile.open (uvMibCsvPath.c_str (), std::ios::out | std::ios::trunc);
+  if (g_uvMibSnapshotFile.is_open ())
+    {
+      g_uvMibSnapshotFile << "time,nodeId,subnet,role,joinState,energy,linkQuality,x,y,z" << std::endl;
+      g_uvMibSnapshotFile.flush ();
+    }
+  std::string tlvTracePath = MakeOutputPathInCategory ("performance", "hnmp-tlv-trace", ".csv");
+  g_hnmpTlvTraceFile.open (tlvTracePath.c_str (), std::ios::out | std::ios::trunc);
+  if (g_hnmpTlvTraceFile.is_open ())
+    {
+      g_hnmpTlvTraceFile << "time,stage,tlvType,src,dst,nodeId,role,summary" << std::endl;
+      g_hnmpTlvTraceFile.flush ();
+    }
+  g_hnmpTlvStats.clear ();
+  g_failoverObserved = false;
   if (g_nmsLogFile.is_open ())
     {
       g_nmsLogFile << "========== NMS Framework Log (simTime=" << simTimeSeconds << "s) ==========" << std::endl;
@@ -9155,6 +9791,7 @@ HeterogeneousNmsFramework::Run (double simTimeSeconds)
     }
 
   // 与 README 标准流程对齐：仿真完成后自动导出可视化数据到 visualization/data
+  bool visualizationExported = false;
   if (!m_outputDir.empty ())
     {
       std::ostringstream exportCmd;
@@ -9163,6 +9800,7 @@ HeterogeneousNmsFramework::Run (double simTimeSeconds)
       int exportRet = std::system (exportCmd.str ().c_str ());
       if (exportRet == 0)
         {
+          visualizationExported = true;
           NmsLog ("INFO", 0, "VIS_EXPORT", "visualization data exported to visualization/data from " + m_outputDir);
         }
       else
@@ -9170,6 +9808,75 @@ HeterogeneousNmsFramework::Run (double simTimeSeconds)
           NmsLog ("WARN", 0, "VIS_EXPORT", "export_visualization_data.py failed for " + m_outputDir);
         }
     }
+
+  {
+    const std::string tlvSummaryPath = MakeOutputPathInCategory ("performance", "hnmp-tlv-summary", ".json");
+    std::ofstream tlvSummary (tlvSummaryPath.c_str (), std::ios::out | std::ios::trunc);
+    if (tlvSummary.is_open ())
+      {
+        tlvSummary << "{\n  \"tlvs\": [\n";
+        bool first = true;
+        for (const auto& kv : g_hnmpTlvStats)
+          {
+            if (!first)
+              {
+                tlvSummary << ",\n";
+              }
+            first = false;
+            tlvSummary << "    {\"tlvType\": \"" << FormatTlvHex (kv.first)
+                       << "\", \"buildCount\": " << kv.second.buildCount
+                       << ", \"txCount\": " << kv.second.txCount
+                       << ", \"rxCount\": " << kv.second.rxCount
+                       << ", \"handleCount\": " << kv.second.handleCount
+                       << ", \"totalBytes\": " << kv.second.totalBytes
+                       << ", \"implemented\": " << (IsImplementedTlv (kv.first) ? "true" : "false")
+                       << ", \"evidenceLevel\": \"" << GetTlvEvidenceLevel (kv.first) << "\"}";
+          }
+        tlvSummary << "\n  ]\n}\n";
+        tlvSummary.close ();
+      }
+  }
+
+  {
+    const std::string validationPath = MakeOutputPathInCategory ("performance", "validation-summary", ".json");
+    const std::string kpiPath = MakeOutputPathInCategory ("performance", "kpi-summary-main", ".json");
+    const std::string uvMibPath = m_dirLog + "/uv_mib_snapshot.csv";
+    const std::string visTopologyPath = "visualization/data/topology.json";
+    const std::string visEventsPath = "visualization/data/events.json";
+    struct stat st = {};
+    bool pcapGenerated = false;
+    if (m_enablePcap)
+      {
+        std::string rawPcapPath = m_dirPacket + "/raw_hnmp.pcap";
+        std::string aggPcapPath = m_dirPacket + "/agg_hnmp.pcap";
+        pcapGenerated = (stat (rawPcapPath.c_str (), &st) == 0) || (stat (aggPcapPath.c_str (), &st) == 0);
+      }
+    const bool kpiGenerated = (stat (kpiPath.c_str (), &st) == 0);
+    const bool uvMibSnapshotGenerated = (stat (uvMibPath.c_str (), &st) == 0);
+    const bool topologyGenerated = (stat (visTopologyPath.c_str (), &st) == 0);
+    const bool eventsGenerated = (stat (visEventsPath.c_str (), &st) == 0);
+    std::ofstream validationFile (validationPath.c_str (), std::ios::out | std::ios::trunc);
+    if (validationFile.is_open ())
+      {
+        validationFile << "{\n";
+        validationFile << "  \"runId\": \"" << m_timestamp << "\",\n";
+        validationFile << "  \"scenarioMode\": \"" << m_scenarioMode << "\",\n";
+        validationFile << "  \"pcapEnabled\": " << (m_enablePcap ? "true" : "false") << ",\n";
+        validationFile << "  \"pcapGenerated\": " << (pcapGenerated ? "true" : "false") << ",\n";
+        validationFile << "  \"visualizationExported\": " << ((visualizationExported && topologyGenerated && eventsGenerated) ? "true" : "false") << ",\n";
+        validationFile << "  \"kpiGenerated\": " << (kpiGenerated ? "true" : "false") << ",\n";
+        validationFile << "  \"joinConfigUsed\": " << (!m_joinConfigPath.empty () ? "true" : "false") << ",\n";
+        validationFile << "  \"scenarioUsed\": " << (!m_scenarioConfigPath.empty () ? "true" : "false") << ",\n";
+        validationFile << "  \"failoverObserved\": " << (g_failoverObserved ? "true" : "false") << ",\n";
+        validationFile << "  \"uvMibSnapshotGenerated\": " << (uvMibSnapshotGenerated ? "true" : "false") << "\n";
+        validationFile << "}\n";
+        validationFile.close ();
+      }
+  }
+
+  if (g_failoverEventsFile.is_open ()) g_failoverEventsFile.close ();
+  if (g_uvMibSnapshotFile.is_open ()) g_uvMibSnapshotFile.close ();
+  if (g_hnmpTlvTraceFile.is_open ()) g_hnmpTlvTraceFile.close ();
 
   if (g_nmsLogFile.is_open ())
     {

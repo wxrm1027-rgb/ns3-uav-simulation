@@ -56,6 +56,29 @@ uint32_t ParseRole011 (const uint8_t* buf, uint32_t len, Role011* out)
   return ROLE_011_TLV_LEN;
 }
 
+uint32_t BuildSubnet012Payload (uint8_t* buf, uint32_t sz, const Subnet012& m)
+{
+  if (!buf || sz < SUBNET_012_TLV_LEN) return 0;
+  WriteTlvHeader (buf, TYPE_SUBNET_012, SUBNET_012_VALUE_LEN);
+  uint32_t o = 3;
+  buf[o++] = m.reporterNodeId;
+  buf[o++] = m.subnetType;
+  buf[o++] = m.qosIntent;
+  buf[o++] = m.reserve;
+  return SUBNET_012_TLV_LEN;
+}
+
+uint32_t ParseSubnet012 (const uint8_t* buf, uint32_t len, Subnet012* out)
+{
+  if (!out || !Check (buf, len, TYPE_SUBNET_012, SUBNET_012_VALUE_LEN)) return 0;
+  uint32_t o = 3;
+  out->reporterNodeId = buf[o++];
+  out->subnetType = buf[o++];
+  out->qosIntent = buf[o++];
+  out->reserve = buf[o++];
+  return SUBNET_012_TLV_LEN;
+}
+
 uint32_t BuildIntent013Payload (uint8_t* buf, uint32_t sz, const Intent013& m)
 {
   if (!buf || sz < INTENT_013_TLV_LEN) return 0;
@@ -115,6 +138,179 @@ uint32_t ParseIntentReport016 (const uint8_t* buf, uint32_t len, IntentReport016
   return INTENT_REPORT_016_TLV_LEN;
 }
 
+uint32_t BuildFlow020Payload (uint8_t* buf, uint32_t sz, const Flow020& m)
+{
+  if (!buf || sz < FLOW_020_TLV_LEN) return 0;
+  WriteTlvHeader (buf, TYPE_FLOW_020, FLOW_020_VALUE_LEN);
+  uint32_t o = 3;
+  buf[o++] = m.reporterNodeId;
+  W16 (buf + o, m.flowId); o += 2;
+  buf[o++] = m.priority;
+  std::memcpy (buf + o, &m.throughputMbps, 8); o += 8;
+  std::memcpy (buf + o, &m.delayMs, 8); o += 8;
+  std::memcpy (buf + o, &m.lossPct, 8); o += 8;
+  return FLOW_020_TLV_LEN;
+}
+
+uint32_t ParseFlow020 (const uint8_t* buf, uint32_t len, Flow020* out)
+{
+  if (!out || !Check (buf, len, TYPE_FLOW_020, FLOW_020_VALUE_LEN)) return 0;
+  uint32_t o = 3;
+  out->reporterNodeId = buf[o++];
+  out->flowId = R16 (buf + o); o += 2;
+  out->priority = buf[o++];
+  std::memcpy (&out->throughputMbps, buf + o, 8); o += 8;
+  std::memcpy (&out->delayMs, buf + o, 8); o += 8;
+  std::memcpy (&out->lossPct, buf + o, 8); o += 8;
+  return FLOW_020_TLV_LEN;
+}
+
+uint32_t BuildFlowAgg021Payload (uint8_t* buf, uint32_t sz, const FlowAgg021& m)
+{
+  if (!buf || sz < FLOW_AGG_021_TLV_LEN) return 0;
+  WriteTlvHeader (buf, TYPE_FLOW_AGG_021, FLOW_AGG_021_VALUE_LEN);
+  uint32_t o = 3;
+  buf[o++] = m.subnetType;
+  buf[o++] = m.flowCount;
+  buf[o++] = m.highPrioCount;
+  buf[o++] = m.mediumPrioCount;
+  std::memcpy (buf + o, &m.avgThroughputMbps, 8); o += 8;
+  std::memcpy (buf + o, &m.avgDelayMs, 8); o += 8;
+  std::memcpy (buf + o, &m.avgLossPct, 8); o += 8;
+  return FLOW_AGG_021_TLV_LEN;
+}
+
+uint32_t ParseFlowAgg021 (const uint8_t* buf, uint32_t len, FlowAgg021* out)
+{
+  if (!out || !Check (buf, len, TYPE_FLOW_AGG_021, FLOW_AGG_021_VALUE_LEN)) return 0;
+  uint32_t o = 3;
+  out->subnetType = buf[o++];
+  out->flowCount = buf[o++];
+  out->highPrioCount = buf[o++];
+  out->mediumPrioCount = buf[o++];
+  std::memcpy (&out->avgThroughputMbps, buf + o, 8); o += 8;
+  std::memcpy (&out->avgDelayMs, buf + o, 8); o += 8;
+  std::memcpy (&out->avgLossPct, buf + o, 8); o += 8;
+  return FLOW_AGG_021_TLV_LEN;
+}
+
+uint32_t BuildTopo030Payload (uint8_t* buf, uint32_t sz, const Topo030& m)
+{
+  if (!buf || sz < TOPO_030_TLV_LEN) return 0;
+  WriteTlvHeader (buf, TYPE_TOPO_030, TOPO_030_VALUE_LEN);
+  uint32_t o = 3;
+  buf[o++] = m.reporterNodeId;
+  buf[o++] = m.neighborCount;
+  std::memcpy (buf + o, &m.avgLinkQuality, 8); o += 8;
+  W16 (buf + o, m.routeCost); o += 2;
+  W16 (buf + o, m.macRetry); o += 2;
+  return TOPO_030_TLV_LEN;
+}
+
+uint32_t ParseTopo030 (const uint8_t* buf, uint32_t len, Topo030* out)
+{
+  if (!out || !Check (buf, len, TYPE_TOPO_030, TOPO_030_VALUE_LEN)) return 0;
+  uint32_t o = 3;
+  out->reporterNodeId = buf[o++];
+  out->neighborCount = buf[o++];
+  std::memcpy (&out->avgLinkQuality, buf + o, 8); o += 8;
+  out->routeCost = R16 (buf + o); o += 2;
+  out->macRetry = R16 (buf + o); o += 2;
+  return TOPO_030_TLV_LEN;
+}
+
+uint32_t BuildLink031Payload (uint8_t* buf, uint32_t sz, const Link031& m)
+{
+  if (!buf || sz < LINK_031_TLV_LEN) return 0;
+  WriteTlvHeader (buf, TYPE_LINK_031, LINK_031_VALUE_LEN);
+  uint32_t o = 3;
+  buf[o++] = m.reporterNodeId;
+  buf[o++] = m.metricType;
+  std::memcpy (buf + o, &m.linkQuality, 8); o += 8;
+  return LINK_031_TLV_LEN;
+}
+
+uint32_t ParseLink031 (const uint8_t* buf, uint32_t len, Link031* out)
+{
+  if (!out || !Check (buf, len, TYPE_LINK_031, LINK_031_VALUE_LEN)) return 0;
+  uint32_t o = 3;
+  out->reporterNodeId = buf[o++];
+  out->metricType = buf[o++];
+  std::memcpy (&out->linkQuality, buf + o, 8); o += 8;
+  return LINK_031_TLV_LEN;
+}
+
+uint32_t BuildLinkLoss032Payload (uint8_t* buf, uint32_t sz, const LinkLoss032& m)
+{
+  if (!buf || sz < LINK_LOSS_032_TLV_LEN) return 0;
+  WriteTlvHeader (buf, TYPE_LINK_LOSS_032, LINK_LOSS_032_VALUE_LEN);
+  uint32_t o = 3;
+  buf[o++] = m.reporterNodeId;
+  buf[o++] = m.peerCount;
+  std::memcpy (buf + o, &m.lossPct, 8); o += 8;
+  return LINK_LOSS_032_TLV_LEN;
+}
+
+uint32_t ParseLinkLoss032 (const uint8_t* buf, uint32_t len, LinkLoss032* out)
+{
+  if (!out || !Check (buf, len, TYPE_LINK_LOSS_032, LINK_LOSS_032_VALUE_LEN)) return 0;
+  uint32_t o = 3;
+  out->reporterNodeId = buf[o++];
+  out->peerCount = buf[o++];
+  std::memcpy (&out->lossPct, buf + o, 8); o += 8;
+  return LINK_LOSS_032_TLV_LEN;
+}
+
+uint32_t BuildLinkStatus033Payload (uint8_t* buf, uint32_t sz, const LinkStatus033& m)
+{
+  if (!buf || sz < LINK_STATUS_033_TLV_LEN) return 0;
+  WriteTlvHeader (buf, TYPE_LINK_STATUS_033, LINK_STATUS_033_VALUE_LEN);
+  uint32_t o = 3;
+  buf[o++] = m.reporterNodeId;
+  buf[o++] = m.linkState;
+  buf[o++] = m.upNeighbors;
+  buf[o++] = m.reserve;
+  return LINK_STATUS_033_TLV_LEN;
+}
+
+uint32_t ParseLinkStatus033 (const uint8_t* buf, uint32_t len, LinkStatus033* out)
+{
+  if (!out || !Check (buf, len, TYPE_LINK_STATUS_033, LINK_STATUS_033_VALUE_LEN)) return 0;
+  uint32_t o = 3;
+  out->reporterNodeId = buf[o++];
+  out->linkState = buf[o++];
+  out->upNeighbors = buf[o++];
+  out->reserve = buf[o++];
+  return LINK_STATUS_033_TLV_LEN;
+}
+
+uint32_t BuildLinkAgg034Payload (uint8_t* buf, uint32_t sz, const LinkAgg034& m)
+{
+  if (!buf || sz < LINK_AGG_034_TLV_LEN) return 0;
+  WriteTlvHeader (buf, TYPE_LINK_AGG_034, LINK_AGG_034_VALUE_LEN);
+  uint32_t o = 3;
+  buf[o++] = m.subnetType;
+  buf[o++] = m.reporterCount;
+  buf[o++] = m.activeLinks;
+  buf[o++] = m.upLinks;
+  std::memcpy (buf + o, &m.avgLinkQuality, 8); o += 8;
+  std::memcpy (buf + o, &m.avgLossPct, 8); o += 8;
+  return LINK_AGG_034_TLV_LEN;
+}
+
+uint32_t ParseLinkAgg034 (const uint8_t* buf, uint32_t len, LinkAgg034* out)
+{
+  if (!out || !Check (buf, len, TYPE_LINK_AGG_034, LINK_AGG_034_VALUE_LEN)) return 0;
+  uint32_t o = 3;
+  out->subnetType = buf[o++];
+  out->reporterCount = buf[o++];
+  out->activeLinks = buf[o++];
+  out->upLinks = buf[o++];
+  std::memcpy (&out->avgLinkQuality, buf + o, 8); o += 8;
+  std::memcpy (&out->avgLossPct, buf + o, 8); o += 8;
+  return LINK_AGG_034_TLV_LEN;
+}
+
 uint32_t BuildAlert040Payload (uint8_t* buf, uint32_t sz, const Alert040& m)
 {
   if (!buf || sz < ALERT_040_TLV_LEN) return 0;
@@ -159,13 +355,23 @@ uint32_t BuildAdhocPayload (uint8_t* buf, uint32_t bufSize, double energy, doubl
 
 uint32_t BuildDataLinkPayload (uint8_t* buf, uint32_t bufSize, double deltaEnergy)
 {
-  if (!buf || bufSize < MAX_DATALINK_PAYLOAD) return 0; WriteTlvHeader (buf, TYPE_LINK_031, 8); std::memcpy (buf + 3, &deltaEnergy, 8); return MAX_DATALINK_PAYLOAD;
+  if (!buf || bufSize < LINK_031_TLV_LEN) return 0;
+  Link031 link = {};
+  link.reporterNodeId = 0;
+  link.metricType = 1;
+  link.linkQuality = deltaEnergy;
+  return BuildLink031Payload (buf, bufSize, link);
 }
 
 uint32_t BuildPolicyPayload (uint8_t* buf, uint32_t maxLen)
 {
-  if (!buf || maxLen < 4) return 0; const char policy[] = "POLICY"; uint16_t len = static_cast<uint16_t> (std::min (sizeof (policy) - 1, (size_t) maxLen));
-  WriteTlvHeader (buf, TYPE_SUBNET_012, len); std::memcpy (buf + 3, policy, len); return 3 + len;
+  if (!buf || maxLen < SUBNET_012_TLV_LEN) return 0;
+  Subnet012 subnet = {};
+  subnet.reporterNodeId = 0;
+  subnet.subnetType = 0;
+  subnet.qosIntent = 1;
+  subnet.reserve = 0;
+  return BuildSubnet012Payload (buf, maxLen, subnet);
 }
 
 uint32_t BuildHelloElectionPayload (uint8_t* buf, uint32_t bufSize, uint32_t nodeId, double score)

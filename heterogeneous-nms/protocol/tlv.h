@@ -15,8 +15,12 @@ static constexpr uint8_t TYPE_EXEC_CMD_014   = 0x14;
 static constexpr uint8_t TYPE_EXEC_RESULT_015 = 0x15;
 static constexpr uint8_t TYPE_INTENT_REPORT_016 = 0x16;
 static constexpr uint8_t TYPE_FLOW_020       = 0x20;
+static constexpr uint8_t TYPE_FLOW_AGG_021   = 0x21;
 static constexpr uint8_t TYPE_TOPO_030       = 0x30;
 static constexpr uint8_t TYPE_LINK_031       = 0x31;
+static constexpr uint8_t TYPE_LINK_LOSS_032  = 0x32;
+static constexpr uint8_t TYPE_LINK_STATUS_033 = 0x33;
+static constexpr uint8_t TYPE_LINK_AGG_034   = 0x34;
 static constexpr uint8_t TYPE_FAULT_040      = 0x40;
 static constexpr uint8_t TYPE_ROUTE_FAIL_041 = 0x41;
 static constexpr uint8_t TYPE_HELLO_ELECTION = 0x80;
@@ -27,19 +31,35 @@ static constexpr uint8_t TYPE_HEARTBEAT_SYNC = 0x84;
 
 static constexpr uint32_t TELEMETRY_010_VALUE_LEN = 26;
 static constexpr uint32_t ROLE_011_VALUE_LEN = 3;
+static constexpr uint32_t SUBNET_012_VALUE_LEN = 4;
 static constexpr uint32_t INTENT_013_VALUE_LEN = 7;
 static constexpr uint32_t EXEC_CMD_014_VALUE_LEN = 8;
 static constexpr uint32_t EXEC_RESULT_015_VALUE_LEN = 4;
 static constexpr uint32_t INTENT_REPORT_016_VALUE_LEN = 4;
+static constexpr uint32_t FLOW_020_VALUE_LEN = 28;
+static constexpr uint32_t FLOW_AGG_021_VALUE_LEN = 28;
+static constexpr uint32_t TOPO_030_VALUE_LEN = 14;
+static constexpr uint32_t LINK_031_VALUE_LEN = 10;
+static constexpr uint32_t LINK_LOSS_032_VALUE_LEN = 10;
+static constexpr uint32_t LINK_STATUS_033_VALUE_LEN = 4;
+static constexpr uint32_t LINK_AGG_034_VALUE_LEN = 20;
 static constexpr uint32_t ALERT_040_VALUE_LEN = 4;
 static constexpr uint32_t ROUTE_FAIL_041_VALUE_LEN = 3;
 
 static constexpr uint32_t TELEMETRY_010_TLV_LEN = 3 + TELEMETRY_010_VALUE_LEN;
 static constexpr uint32_t ROLE_011_TLV_LEN = 3 + ROLE_011_VALUE_LEN;
+static constexpr uint32_t SUBNET_012_TLV_LEN = 3 + SUBNET_012_VALUE_LEN;
 static constexpr uint32_t INTENT_013_TLV_LEN = 3 + INTENT_013_VALUE_LEN;
 static constexpr uint32_t EXEC_CMD_014_TLV_LEN = 3 + EXEC_CMD_014_VALUE_LEN;
 static constexpr uint32_t EXEC_RESULT_015_TLV_LEN = 3 + EXEC_RESULT_015_VALUE_LEN;
 static constexpr uint32_t INTENT_REPORT_016_TLV_LEN = 3 + INTENT_REPORT_016_VALUE_LEN;
+static constexpr uint32_t FLOW_020_TLV_LEN = 3 + FLOW_020_VALUE_LEN;
+static constexpr uint32_t FLOW_AGG_021_TLV_LEN = 3 + FLOW_AGG_021_VALUE_LEN;
+static constexpr uint32_t TOPO_030_TLV_LEN = 3 + TOPO_030_VALUE_LEN;
+static constexpr uint32_t LINK_031_TLV_LEN = 3 + LINK_031_VALUE_LEN;
+static constexpr uint32_t LINK_LOSS_032_TLV_LEN = 3 + LINK_LOSS_032_VALUE_LEN;
+static constexpr uint32_t LINK_STATUS_033_TLV_LEN = 3 + LINK_STATUS_033_VALUE_LEN;
+static constexpr uint32_t LINK_AGG_034_TLV_LEN = 3 + LINK_AGG_034_VALUE_LEN;
 static constexpr uint32_t ALERT_040_TLV_LEN = 3 + ALERT_040_VALUE_LEN;
 static constexpr uint32_t ROUTE_FAIL_041_TLV_LEN = 3 + ROUTE_FAIL_041_VALUE_LEN;
 
@@ -69,6 +89,14 @@ struct Role011
   uint8_t nodeId;
   uint8_t roleType;
   uint8_t computeLevel;
+};
+
+struct Subnet012
+{
+  uint8_t reporterNodeId;
+  uint8_t subnetType;
+  uint8_t qosIntent;
+  uint8_t reserve;
 };
 
 struct Intent013
@@ -105,6 +133,68 @@ struct IntentReport016
   uint8_t failCount;
 };
 
+struct Flow020
+{
+  uint8_t reporterNodeId;
+  uint16_t flowId;
+  uint8_t priority;
+  double throughputMbps;
+  double delayMs;
+  double lossPct;
+};
+
+struct FlowAgg021
+{
+  uint8_t subnetType;
+  uint8_t flowCount;
+  uint8_t highPrioCount;
+  uint8_t mediumPrioCount;
+  double avgThroughputMbps;
+  double avgDelayMs;
+  double avgLossPct;
+};
+
+struct Topo030
+{
+  uint8_t reporterNodeId;
+  uint8_t neighborCount;
+  double avgLinkQuality;
+  uint16_t routeCost;
+  uint16_t macRetry;
+};
+
+struct Link031
+{
+  uint8_t reporterNodeId;
+  uint8_t metricType;
+  double linkQuality;
+};
+
+struct LinkLoss032
+{
+  uint8_t reporterNodeId;
+  uint8_t peerCount;
+  double lossPct;
+};
+
+struct LinkStatus033
+{
+  uint8_t reporterNodeId;
+  uint8_t linkState;
+  uint8_t upNeighbors;
+  uint8_t reserve;
+};
+
+struct LinkAgg034
+{
+  uint8_t subnetType;
+  uint8_t reporterCount;
+  uint8_t activeLinks;
+  uint8_t upLinks;
+  double avgLinkQuality;
+  double avgLossPct;
+};
+
 struct Alert040
 {
   uint8_t reportNodeId;
@@ -126,6 +216,8 @@ uint32_t BuildTelemetry010Payload (uint8_t* buf, uint32_t bufSize, const Telemet
 uint32_t ParseTelemetry010 (const uint8_t* buf, uint32_t len, Telemetry010* out);
 uint32_t BuildRole011Payload (uint8_t* buf, uint32_t bufSize, const Role011& m);
 uint32_t ParseRole011 (const uint8_t* buf, uint32_t len, Role011* out);
+uint32_t BuildSubnet012Payload (uint8_t* buf, uint32_t bufSize, const Subnet012& m);
+uint32_t ParseSubnet012 (const uint8_t* buf, uint32_t len, Subnet012* out);
 uint32_t BuildIntent013Payload (uint8_t* buf, uint32_t bufSize, const Intent013& m);
 uint32_t ParseIntent013 (const uint8_t* buf, uint32_t len, Intent013* out);
 uint32_t BuildExecCmd014Payload (uint8_t* buf, uint32_t bufSize, const ExecCmd014& m);
@@ -134,6 +226,20 @@ uint32_t BuildExecResult015Payload (uint8_t* buf, uint32_t bufSize, const ExecRe
 uint32_t ParseExecResult015 (const uint8_t* buf, uint32_t len, ExecResult015* out);
 uint32_t BuildIntentReport016Payload (uint8_t* buf, uint32_t bufSize, const IntentReport016& m);
 uint32_t ParseIntentReport016 (const uint8_t* buf, uint32_t len, IntentReport016* out);
+uint32_t BuildFlow020Payload (uint8_t* buf, uint32_t bufSize, const Flow020& m);
+uint32_t ParseFlow020 (const uint8_t* buf, uint32_t len, Flow020* out);
+uint32_t BuildFlowAgg021Payload (uint8_t* buf, uint32_t bufSize, const FlowAgg021& m);
+uint32_t ParseFlowAgg021 (const uint8_t* buf, uint32_t len, FlowAgg021* out);
+uint32_t BuildTopo030Payload (uint8_t* buf, uint32_t bufSize, const Topo030& m);
+uint32_t ParseTopo030 (const uint8_t* buf, uint32_t len, Topo030* out);
+uint32_t BuildLink031Payload (uint8_t* buf, uint32_t bufSize, const Link031& m);
+uint32_t ParseLink031 (const uint8_t* buf, uint32_t len, Link031* out);
+uint32_t BuildLinkLoss032Payload (uint8_t* buf, uint32_t bufSize, const LinkLoss032& m);
+uint32_t ParseLinkLoss032 (const uint8_t* buf, uint32_t len, LinkLoss032* out);
+uint32_t BuildLinkStatus033Payload (uint8_t* buf, uint32_t bufSize, const LinkStatus033& m);
+uint32_t ParseLinkStatus033 (const uint8_t* buf, uint32_t len, LinkStatus033* out);
+uint32_t BuildLinkAgg034Payload (uint8_t* buf, uint32_t bufSize, const LinkAgg034& m);
+uint32_t ParseLinkAgg034 (const uint8_t* buf, uint32_t len, LinkAgg034* out);
 uint32_t BuildAlert040Payload (uint8_t* buf, uint32_t bufSize, const Alert040& m);
 uint32_t ParseAlert040 (const uint8_t* buf, uint32_t len, Alert040* out);
 uint32_t BuildRouteFail041Payload (uint8_t* buf, uint32_t bufSize, const RouteFail041& m);
